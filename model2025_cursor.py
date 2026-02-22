@@ -90,8 +90,107 @@ df_rpm['Label'] = 'RPM'
 # ===============================
 full_df = pd.concat([df_normal, df_dos, df_fuzzy, df_gear, df_rpm], ignore_index=True)
 
-# CAN_ID, DLC, DATA[0-7] per dataset attributes
+# Feature columns used for modeling (defined early for EDA)
 features = ['CAN_ID', 'DLC', 'DATA0', 'DATA1', 'DATA2', 'DATA3', 'DATA4', 'DATA5', 'DATA6', 'DATA7']
+
+# ===============================
+# Exploratory Data Analysis (EDA)
+# ===============================
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+plt.rcParams['figure.figsize'] = (10, 6)
+plt.rcParams['font.size'] = 10
+
+# ----- EDA 1: Class distribution -----
+fig, ax = plt.subplots(figsize=(8, 4))
+counts = full_df['Label'].value_counts()
+colors = sns.color_palette("Set2", n_colors=len(counts))
+bars = ax.bar(counts.index, counts.values, color=colors, edgecolor='black', linewidth=0.5)
+ax.set_xlabel('Class')
+ax.set_ylabel('Number of messages')
+ax.set_title('EDA — Class distribution')
+for bar in bars:
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(counts.values)*0.008,
+            f'{int(bar.get_height()):,}', ha='center', va='bottom', fontsize=9)
+plt.xticks(rotation=25)
+plt.tight_layout()
+plt.show()
+
+# ----- EDA 2: Top CAN IDs (overall) -----
+fig, ax = plt.subplots(figsize=(10, 4))
+top_can = full_df['CAN_ID'].value_counts().head(20)
+ax.barh(range(len(top_can)), top_can.values, color=sns.color_palette("viridis", len(top_can)))
+ax.set_yticks(range(len(top_can)))
+ax.set_yticklabels([f'0x{x:04X}' for x in top_can.index], fontsize=9)
+ax.set_xlabel('Message count')
+ax.set_ylabel('CAN ID')
+ax.set_title('EDA — Top 20 CAN IDs by frequency')
+ax.invert_yaxis()
+plt.tight_layout()
+plt.show()
+
+# ----- EDA 3: DLC distribution -----
+fig, ax = plt.subplots(figsize=(7, 4))
+dlc_counts = full_df['DLC'].value_counts().sort_index()
+ax.bar(dlc_counts.index.astype(str), dlc_counts.values, color='steelblue', edgecolor='black', linewidth=0.5)
+ax.set_xlabel('DLC (Data Length Code)')
+ax.set_ylabel('Count')
+ax.set_title('EDA — DLC distribution (0–8 bytes)')
+plt.tight_layout()
+plt.show()
+
+# ----- EDA 4: Feature correlation heatmap -----
+fig, ax = plt.subplots(figsize=(9, 7))
+corr = full_df[features].corr()
+sns.heatmap(corr, annot=True, fmt='.2f', cmap='RdBu_r', center=0, ax=ax, square=True,
+            linewidths=0.5, cbar_kws={'label': 'Correlation'})
+ax.set_title('EDA — Correlation between CAN_ID, DLC, DATA0–7')
+plt.tight_layout()
+plt.show()
+
+# ----- EDA 5: DATA byte distributions by class (box plots, one byte per subplot) -----
+data_cols = [f'DATA{i}' for i in range(8)]
+fig, axes = plt.subplots(2, 4, figsize=(14, 8))
+axes = axes.flatten()
+for i, col in enumerate(data_cols):
+    sns.boxplot(data=full_df, x='Label', y=col, ax=axes[i], palette='Set3')
+    axes[i].set_title(col)
+    axes[i].set_xlabel('')
+    axes[i].tick_params(axis='x', rotation=25)
+fig.suptitle('EDA — DATA byte distributions by class', fontsize=12, y=1.02)
+plt.tight_layout()
+plt.show()
+
+# ----- EDA 6: CAN_ID distribution by class (stacked/top IDs per class) -----
+fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+axes = axes.flatten()
+for idx, label in enumerate(full_df['Label'].unique()):
+    sub = full_df[full_df['Label'] == label]
+    top = sub['CAN_ID'].value_counts().head(10)
+    ax = axes[idx]
+    ax.barh(range(len(top)), top.values, color=sns.color_palette("rocket", len(top)))
+    ax.set_yticks(range(len(top)))
+    ax.set_yticklabels([f'0x{x:04X}' for x in top.index], fontsize=8)
+    ax.set_xlabel('Count')
+    ax.set_title(label)
+    ax.invert_yaxis()
+# Hide unused subplot if 5 classes
+if len(full_df['Label'].unique()) < 6:
+    axes[5].axis('off')
+plt.suptitle('EDA — Top 10 CAN IDs per class', fontsize=12, y=1.02)
+plt.tight_layout()
+plt.show()
+
+# ----- EDA 7: Sample sizes and basic stats table -----
+print("\n--- EDA — Dataset summary ---")
+print(f"Total messages: {len(full_df):,}")
+print(f"Classes: {list(full_df['Label'].unique())}")
+print("\nSample count per class:")
+print(full_df['Label'].value_counts().to_string())
+print("\nBasic stats (features):")
+print(full_df[features].describe().round(2).to_string())
+
 N_FEATURES = len(features)
 X = full_df[features].values
 y = full_df['Label'].values
@@ -154,7 +253,7 @@ classifier.compile(
     metrics=['accuracy']
 )
 
-classifier.fit(
+history_classifier = classifier.fit(
     X_train_lstm, y_train,
     epochs=30,
     batch_size=64,
@@ -183,7 +282,7 @@ decoded = Dense(input_dim, activation='linear')(decoded)
 autoencoder = Model(input_ae, decoded)
 autoencoder.compile(optimizer='adam', loss='mse')
 
-autoencoder.fit(
+history_autoencoder = autoencoder.fit(
     X_train_normal, X_train_normal,
     epochs=30,
     batch_size=64,
@@ -233,12 +332,112 @@ def hybrid_predict(sample, scaled=True):
 # ===============================
 # Hybrid Evaluation
 # ===============================
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
 hybrid_results = []
 for i in range(len(X_test)):
     hybrid_results.append(hybrid_predict(X_test[i], scaled=True))
 
 true_labels = le.inverse_transform(np.argmax(y_test, axis=1))
+hybrid_accuracy = accuracy_score(true_labels, hybrid_results)
+print("Hybrid Accuracy:", hybrid_accuracy)
 
-print("Hybrid Accuracy:", accuracy_score(true_labels, hybrid_results))
+# ===============================
+# Visualizations for Evaluation
+# ===============================
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Use a style that works well in notebooks
+plt.rcParams['figure.figsize'] = (10, 6)
+plt.rcParams['font.size'] = 10
+
+# ----- 1. Class distribution in dataset -----
+fig, ax = plt.subplots(figsize=(8, 4))
+label_counts = full_df['Label'].value_counts()
+colors = sns.color_palette("Set2", n_colors=len(label_counts))
+bars = ax.bar(label_counts.index, label_counts.values, color=colors, edgecolor='black', linewidth=0.5)
+ax.set_xlabel('Class')
+ax.set_ylabel('Count')
+ax.set_title('Class Distribution in Dataset')
+for bar in bars:
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(label_counts.values)*0.01,
+            str(int(bar.get_height())), ha='center', va='bottom', fontsize=9)
+plt.xticks(rotation=25)
+plt.tight_layout()
+plt.show()
+
+# ----- 2. LSTM classifier training curves -----
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+epochs_c = range(1, len(history_classifier.history['loss']) + 1)
+ax1.plot(epochs_c, history_classifier.history['loss'], 'b-', label='Train loss')
+ax1.plot(epochs_c, history_classifier.history['val_loss'], 'b--', label='Val loss')
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Loss')
+ax1.set_title('LSTM Classifier — Loss')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+ax2.plot(epochs_c, history_classifier.history['accuracy'], 'g-', label='Train accuracy')
+ax2.plot(epochs_c, history_classifier.history['val_accuracy'], 'g--', label='Val accuracy')
+ax2.set_xlabel('Epoch')
+ax2.set_ylabel('Accuracy')
+ax2.set_title('LSTM Classifier — Accuracy')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ----- 3. Autoencoder training curve -----
+fig, ax = plt.subplots(figsize=(8, 4))
+epochs_ae = range(1, len(history_autoencoder.history['loss']) + 1)
+ax.plot(epochs_ae, history_autoencoder.history['loss'], 'b-', label='Train loss')
+ax.plot(epochs_ae, history_autoencoder.history['val_loss'], 'b--', label='Val loss')
+ax.set_xlabel('Epoch')
+ax.set_ylabel('MSE Loss')
+ax.set_title('Autoencoder — Reconstruction Loss')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ----- 4. Confusion matrix (hybrid predictions) -----
+# Include all classes (encoder order); "Unknown Attack" may appear only in predictions
+all_labels = list(le.classes_) + ["Unknown Attack"]
+all_labels = sorted(set(all_labels))
+cm = confusion_matrix(true_labels, hybrid_results, labels=all_labels)
+fig, ax = plt.subplots(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+            xticklabels=all_labels, yticklabels=all_labels,
+            cbar_kws={'label': 'Count'})
+ax.set_xlabel('Predicted')
+ax.set_ylabel('True')
+ax.set_title('Hybrid Model — Confusion Matrix')
+plt.xticks(rotation=25)
+plt.yticks(rotation=0)
+plt.tight_layout()
+plt.show()
+
+# ----- 5. Reconstruction error: Normal vs Attack (test set) -----
+normal_label_idx = le.transform(['Normal'])[0]
+test_normal_mask = np.argmax(y_test, axis=1) == normal_label_idx
+X_test_normal = X_test[test_normal_mask]
+X_test_attack = X_test[~test_normal_mask]
+recon_test_normal = autoencoder.predict(X_test_normal, verbose=0)
+recon_test_attack = autoencoder.predict(X_test_attack, verbose=0)
+loss_normal = np.mean(np.square(X_test_normal - recon_test_normal), axis=1)
+loss_attack = np.mean(np.square(X_test_attack - recon_test_attack), axis=1)
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.hist(loss_normal, bins=50, alpha=0.6, label='Normal', color='green', density=True, edgecolor='black', linewidth=0.3)
+ax.hist(loss_attack, bins=50, alpha=0.6, label='Attack', color='red', density=True, edgecolor='black', linewidth=0.3)
+ax.axvline(threshold, color='black', linestyle='--', linewidth=2, label=f'Threshold ({threshold:.4f})')
+ax.set_xlabel('Reconstruction MSE')
+ax.set_ylabel('Density')
+ax.set_title('Autoencoder Reconstruction Error — Normal vs Attack (Test Set)')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ----- 6. Classification report (text summary) -----
+print("\n--- Hybrid Model — Classification Report ---")
+print(classification_report(true_labels, hybrid_results))
