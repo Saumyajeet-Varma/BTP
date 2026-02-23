@@ -61,28 +61,28 @@ This document summarizes the **Intrusion Detection System (IDS)** pipeline imple
 
 The pipeline is **two-stage** and uses a **swapped order** (attack classifier first, then autoencoder):
 
-1. **Stage 01 — Attack-type classifier (run first)**  
+1. **Stage 01 — Multiple-attack classifier (run first)**  
    - LSTM model trained only on **attack** samples.  
-   - Output: one of **DoS**, **Fuzzy**, **Gear**, **RPM** (4 classes).
+   - **Role:** Classifies traffic into one of the **known attack types** — **DoS**, **Fuzzy**, **Gear**, **RPM** (4 classes).
 
-2. **Stage 02 — Autoencoder (run second)**  
+2. **Stage 02 — Normal profile & unknown-attack detection (run second)**  
    - Autoencoder trained only on **normal** traffic.  
-   - Reconstruction error on normal training data is used to set a **threshold** (e.g. `mean(train_loss) + 3 * std(train_loss)`).  
-   - Used to decide whether a sample is “Normal” (low recon error) or not.
+   - **Role:** Models normal behaviour; high reconstruction error indicates deviation from normal (i.e. attack), including **unknown attacks** not seen in training.  
+   - A **threshold** (e.g. `mean(train_loss) + 3 * std(train_loss)` on normal training data) separates “Normal” (low recon error) from “Not Normal” (attack or unknown attack).
 
 **Prediction logic (`revamp_predict`):**  
 - Run **Stage 01** (LSTM) on the sample → get tentative **attack_type** (DoS/Fuzzy/Gear/RPM).  
 - Run **Stage 02** (autoencoder) on the sample → compute reconstruction error.  
 - If reconstruction error **≤ threshold** → return **"Normal"** (override LSTM).  
-- Else → return the **attack_type** from Stage 01.
+- Else → return the **attack_type** from Stage 01 (known attack) or treat as attack/anomaly (covers unknown attacks).
 
-So: **LSTM first** for every sample; **autoencoder second** to refine “Normal” and reduce false attack labels.
+So: **Stage 1** classifies **multiple known attacks**; **Stage 2** uses normal data to identify Normal vs non-normal and supports **detecting unknown attacks** via high reconstruction error.
 
 ---
 
 ## 4. Model Architecture
 
-**Stage 01 — Attack classifier (LSTM)**  
+**Stage 01 — Multiple-attack classifier (LSTM)**  
 - Input: `(batch, 1, N_FEATURES)`.  
 - LSTM(128, return_sequences=False).  
 - BatchNormalization.  
@@ -92,11 +92,12 @@ So: **LSTM first** for every sample; **autoencoder second** to refine “Normal�
 - Dense(32, relu).  
 - Dense(4, softmax) → DoS, Fuzzy, Gear, RPM.
 
-**Stage 02 — Autoencoder**  
+**Stage 02 — Autoencoder (normal profile / unknown-attack detection)**  
 - Input: `(batch, input_dim)` with `input_dim = 10`.  
 - Encoder: Dense(64, relu) → BatchNorm → Dense(32, relu) → Dense(16, relu).  
 - Decoder: Dense(32, relu) → Dense(64, relu) → Dense(input_dim, linear).  
-- Loss: MSE; metric: MAE.
+- Loss: MSE; metric: MAE.  
+- Trained on normal data only; high reconstruction error flags anomalies (including unknown attacks).
 
 **Threshold:**  
 - Computed on **training normal** data: reconstruct with autoencoder, then `threshold = mean(MSE per sample) + 3 * std(MSE per sample)`.
@@ -138,11 +139,11 @@ So: **LSTM first** for every sample; **autoencoder second** to refine “Normal�
 
 ## 7. Why This Model
 
-- **Two-stage design:** Separates (1) “Normal vs attack” and (2) “which attack type,” which fits CAN traffic where normal is abundant and attack types are distinct.
+- **Two-stage design:** **Stage 1** classifies **multiple known attacks** (DoS, Fuzzy, Gear, RPM); **Stage 2** uses **normal data** to model normal behaviour and to **detect unknown attacks** (high reconstruction error = not normal). This fits CAN traffic where normal is abundant and attack types are distinct.
 - **Swapped order (LSTM → Autoencoder):**  
-  - LSTM sees all samples and gives a tentative attack label.  
-  - Autoencoder, trained on normal only, corrects false attack predictions when the sample looks “normal” (low reconstruction error).  
-  - This can improve precision on Normal and reduce false positives from the classifier.
+  - Stage 1 (LSTM) sees all samples and gives a tentative known-attack label.  
+  - Stage 2 (autoencoder), trained on normal only, corrects to “Normal” when the sample looks normal (low reconstruction error) and flags non-normal traffic (including unknown attacks) when reconstruction error is high.  
+  - This improves precision on Normal, reduces false attack labels, and supports detection of unseen attack types.
 - **Flag-based labeling:** Uses the dataset’s `Flag` (R/T) so that mixed attack files are labeled per message, improving supervision quality.
 - **Subset option:** Allows fast iteration and debugging without loading the full dataset.
 
@@ -162,7 +163,7 @@ So: **LSTM first** for every sample; **autoencoder second** to refine “Normal�
 - **Class imbalance:** DoS/Normal (or other) imbalance may require stronger class weighting or resampling.  
 - **Threshold sensitivity:** Fixed “mean + 3×std” may not suit all distributions; may need validation-based tuning.  
 - **Generalization:** Performance on different vehicles or driving conditions is uncertain; cross-domain validation is important.  
-- **Adversarial or novel attacks:** Model is trained on known attack types; detection of unseen attack patterns would need anomaly or out-of-distribution components.
+- **Adversarial or novel attacks:** Stage 1 is limited to known attack types; Stage 2 (autoencoder on normal) provides anomaly detection so unknown attacks can be flagged by high reconstruction error, though they may be reported under a known-attack label from Stage 1 unless an explicit “Unknown” bucket is added.
 
 ---
 
