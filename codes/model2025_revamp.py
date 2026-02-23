@@ -72,21 +72,44 @@ column_names = [
     'Flag'
 ]
 
-df_dos = pd.read_csv(os.path.join(data_path,'dos_attack.csv'),
+def convert_numeric_columns(df, columns_to_convert):
+    for col in columns_to_convert:
+        if col == 'CAN_ID' or col.startswith('DATA'):
+            # Convert from hex string to integer, handling potential non-string values
+            # Use regex to check if string looks like a hex number before conversion
+            df[col] = df[col].astype(str).apply(lambda x: int(x, 16) if re.match(r'^[0-9a-fA-F]+$', x.strip()) else np.nan)
+        else:
+            # For other numeric columns like DLC, convert directly to numeric
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        # Fill any NaN values with 0 and convert to integer type
+        df[col] = df[col].fillna(0).astype(int)
+    return df
+
+cols_to_process = ['CAN_ID', 'DLC'] + [f'DATA{i}' for i in range(8)]
+
+df_dos = pd.read_csv(os.path.join(data_path,'DoS_dataset.csv'),
                      header=None, names=column_names)
+df_dos = convert_numeric_columns(df_dos, cols_to_process)
 df_dos['Label'] = 'DoS'
+print("DoS df done")
 
-df_fuzzy = pd.read_csv(os.path.join(data_path,'fuzzy_attack.csv'),
+df_fuzzy = pd.read_csv(os.path.join(data_path,'Fuzzy_dataset.csv'),
                        header=None, names=column_names)
+df_fuzzy = convert_numeric_columns(df_fuzzy, cols_to_process)
 df_fuzzy['Label'] = 'Fuzzy'
+print("Fuzzy df done")
 
-df_gear = pd.read_csv(os.path.join(data_path,'gear_spoofing.csv'),
+df_gear = pd.read_csv(os.path.join(data_path,'gear_dataset.csv'),
                       header=None, names=column_names)
+df_gear = convert_numeric_columns(df_gear, cols_to_process)
 df_gear['Label'] = 'Gear'
+print("gear df done")
 
-df_rpm = pd.read_csv(os.path.join(data_path,'rpm_spoofing.csv'),
+df_rpm = pd.read_csv(os.path.join(data_path,'RPM_dataset.csv'),
                      header=None, names=column_names)
+df_rpm = convert_numeric_columns(df_rpm, cols_to_process)
 df_rpm['Label'] = 'RPM'
+print("RPM df done")
 
 # ===============================
 # Combine All Data
