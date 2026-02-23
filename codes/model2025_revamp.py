@@ -87,28 +87,42 @@ def convert_numeric_columns(df, columns_to_convert):
 
 cols_to_process = ['CAN_ID', 'DLC'] + [f'DATA{i}' for i in range(8)]
 
+# Flag in attack CSVs: 'T' = injected (attacked), 'R' = normal message
+def label_from_flag(flag_series, attack_name):
+    """Label each row: Normal if Flag=='R', else attack type if Flag=='T'."""
+    labels = []
+    for v in flag_series.astype(str).str.strip().str.upper():
+        if v == 'R':
+            labels.append('Normal')
+        elif v == 'T':
+            labels.append(attack_name)
+        else:
+            # Fallback: treat unknown as Normal to be conservative
+            labels.append('Normal')
+    return labels
+
 df_dos = pd.read_csv(os.path.join(data_path,'DoS_dataset.csv'),
                      header=None, names=column_names)
 df_dos = convert_numeric_columns(df_dos, cols_to_process)
-df_dos['Label'] = 'DoS'
+df_dos['Label'] = label_from_flag(df_dos['Flag'], 'DoS')
 print("DoS df done")
 
 df_fuzzy = pd.read_csv(os.path.join(data_path,'Fuzzy_dataset.csv'),
                        header=None, names=column_names)
 df_fuzzy = convert_numeric_columns(df_fuzzy, cols_to_process)
-df_fuzzy['Label'] = 'Fuzzy'
+df_fuzzy['Label'] = label_from_flag(df_fuzzy['Flag'], 'Fuzzy')
 print("Fuzzy df done")
 
 df_gear = pd.read_csv(os.path.join(data_path,'gear_dataset.csv'),
                       header=None, names=column_names)
 df_gear = convert_numeric_columns(df_gear, cols_to_process)
-df_gear['Label'] = 'Gear'
+df_gear['Label'] = label_from_flag(df_gear['Flag'], 'Gear')
 print("gear df done")
 
 df_rpm = pd.read_csv(os.path.join(data_path,'RPM_dataset.csv'),
                      header=None, names=column_names)
 df_rpm = convert_numeric_columns(df_rpm, cols_to_process)
-df_rpm['Label'] = 'RPM'
+df_rpm['Label'] = label_from_flag(df_rpm['Flag'], 'RPM')
 print("RPM df done")
 
 # ===============================
@@ -195,13 +209,14 @@ decoded = Dense(64, activation='relu')(decoded)
 decoded = Dense(input_dim, activation='linear')(decoded)
 
 autoencoder = Model(input_ae, decoded)
-autoencoder.compile(optimizer='adam', loss='mse')
+autoencoder.compile(optimizer='adam', loss='mse', metrics=['mae'])
 
 history_autoencoder = autoencoder.fit(
     X_train_normal, X_train_normal,
     epochs=30,
     batch_size=64,
     validation_split=0.1,
+    verbose=2,  # one line per epoch: loss, mae, val_loss, val_mae
     callbacks=[EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)]
 )
 
@@ -261,6 +276,7 @@ history_attack = attack_classifier.fit(
     epochs=30,
     batch_size=64,
     validation_split=0.1,
+    verbose=2,  # one line per epoch: loss, accuracy, val_loss, val_accuracy
     class_weight=class_weights_attack_dict,
     callbacks=[EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)]
 )
