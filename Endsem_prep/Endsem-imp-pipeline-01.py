@@ -538,11 +538,20 @@ else:
     y_cal_pred = predict_stage1_labels(stage1_model, cal_loader)
     y_test_pred = predict_stage1_labels(stage1_model, test_loader)
 
+    # ===============================
+    # Stage 1 — Test: accuracy, report, confusion matrix
+    # ===============================
     acc1 = accuracy_score(y_test, y_test_pred)
     _, _, f1w, _ = precision_recall_fscore_support(y_test, y_test_pred, average="weighted")
-    print("Stage 1 test accuracy:", round(acc1, 4), "| weighted F1:", round(f1w, 4))
-    print("\nClassification report (Stage 1):")
-    print(classification_report(y_test, y_test_pred, target_names=le.classes_))
+    cm1 = confusion_matrix(y_test, y_test_pred, labels=np.arange(num_classes))
+    print("\n" + "=" * 70)
+    print("STAGE 1 — Multi-class classifier (test set)")
+    print("=" * 70)
+    print("Accuracy:", round(acc1, 4), "| Weighted F1:", round(f1w, 4))
+    print("\nClassification report:")
+    print(classification_report(y_test, y_test_pred, target_names=le.classes_, zero_division=0))
+    print("Confusion matrix [rows = true, cols = pred] | order:", list(le.classes_))
+    print(cm1)
 
     # ===============================
     # Stage 2 — AAE on normal-only train
@@ -614,24 +623,65 @@ else:
     normal_cleared = (final_label[tn_mask] == "Normal").mean() if tn_mask.any() else 0.0
     normal_fpr = (final_label[tn_mask] != "Normal").mean() if tn_mask.any() else 0.0
 
-    print("\n--- Two-stage summary (test) ---")
-    print("Hybrid binary Acc:", round(h_acc, 4), "| P:", round(hp, 4), "| R:", round(hr, 4), "| F1:", round(hf1, 4))
+    print("\n" + "=" * 70)
+    print("STAGE 2 — Anomaly detector (test, only where Stage 1 predicted Normal)")
+    print("=" * 70)
+    s2_mask = y_test_pred == normal_idx
+    n_s2 = int(s2_mask.sum())
+    if n_s2 == 0:
+        print("No test samples with Stage1=Normal; skip Stage 2 gated metrics.")
+        cm_s2 = np.zeros((2, 2), dtype=int)
+        acc_s2 = float("nan")
+    else:
+        # True: 0=Normal, 1=Attack | Pred: 0=score<=threshold (pass), 1=Anomaly
+        y_s2_true = (y_test[s2_mask] != normal_idx).astype(int)
+        y_s2_pred = (test_scores[s2_mask] > threshold).astype(int)
+        acc_s2 = accuracy_score(y_s2_true, y_s2_pred)
+        print("Samples on Stage-2 path (Stage1 said Normal):", n_s2)
+        print("Accuracy (true Normal/Attack vs pass/anomaly):", round(acc_s2, 4))
+        print("\nClassification report (true row = Normal vs Attack; pred = pass vs anomaly flag):")
+        print(
+            classification_report(
+                y_s2_true,
+                y_s2_pred,
+                labels=[0, 1],
+                target_names=["True: Normal", "True: Attack"],
+                zero_division=0,
+            )
+        )
+        cm_s2 = confusion_matrix(y_s2_true, y_s2_pred, labels=[0, 1])
+        print("Confusion matrix [rows = true 0/1 Normal/Attack, cols = pred 0/1 pass/anomaly]:")
+        print(cm_s2)
+
+    print("\n" + "=" * 70)
+    print("HYBRID — Full pipeline (test set): true class vs final decision")
+    print("=" * 70)
+    true_names = le.inverse_transform(y_test)
+    hyb_labels = sorted(set(true_names.tolist()) | set(final_label.tolist()))
+    acc_hybrid = accuracy_score(true_names, final_label)
+    print("Accuracy (true label vs final_label):", round(acc_hybrid, 4))
+    print("\nClassification report:")
+    print(classification_report(true_names, final_label, labels=hyb_labels, zero_division=0))
+    cm_hybrid = confusion_matrix(true_names, final_label, labels=hyb_labels)
+    print("Confusion matrix [rows = true, cols = pred] | label order:")
+    print(hyb_labels)
+    print(cm_hybrid)
+
+    print("\n" + "=" * 70)
+    print("HYBRID — Binary summary (any attack vs not) + calibration notes")
+    print("=" * 70)
+    print("Binary Acc:", round(h_acc, 4), "| P:", round(hp, 4), "| R:", round(hr, 4), "| F1:", round(hf1, 4))
     try:
         auc = roc_auc_score(true_is_attack.astype(int), test_scores)
-        print("Score AUC (attack vs normal, raw scores):", round(auc, 4))
+        print("Score AUC (attack vs normal, raw scores on all test):", round(auc, 4))
     except Exception:
         pass
     print("True Normal -> final Normal (both stages):", "{:.2%}".format(normal_cleared))
     print("True Normal -> flagged (Stage 2 FP):", "{:.2%}".format(normal_fpr))
 
-    print("\nDecision counts:")
+    print("\nDecision counts (hybrid final_label):")
     for lab in np.unique(final_label):
         print(" ", lab, ":", int((final_label == lab).sum()))
-
-    cm1 = confusion_matrix(y_test, y_test_pred)
-    print("\nStage 1 confusion matrix (rows/cols = class order):")
-    print(list(le.classes_))
-    print(cm1)
 
     # ===============================
     # Visualizations
@@ -685,7 +735,6 @@ else:
     plt.show()
 
     # 4) Combined anomaly score — Normal vs Attack (test)
-    y_bin = (y_test != normal_idx).astype(int)
     sc_normal = test_scores[y_test == normal_idx]
     sc_attack = test_scores[y_test != normal_idx]
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -717,6 +766,45 @@ else:
     ax.set_title("Stage 2 — Score: Normal vs Attack (test, all samples)")
     ax.legend()
     ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # 5) Stage 2 — confusion matrix (gated path: Stage1=Normal)
+    if n_s2 > 0:
+        fig, ax = plt.subplots(figsize=(5.5, 4.5))
+        s2_xtick = ["Pred: pass\n(score<=T)", "Pred: anomaly\n(score>T)"]
+        s2_ytick = ["True: Normal", "True: Attack"]
+        sns.heatmap(
+            cm_s2,
+            annot=True,
+            fmt="d",
+            cmap="Oranges",
+            ax=ax,
+            xticklabels=s2_xtick,
+            yticklabels=s2_ytick,
+            cbar_kws={"label": "Count"},
+        )
+        ax.set_title("Stage 2 — Confusion (test | Stage1 predicted Normal only)")
+        plt.tight_layout()
+        plt.show()
+
+    # 6) Hybrid — confusion matrix (true class vs final decision)
+    fig_h, ax_h = plt.subplots(figsize=(max(8, 0.45 * len(hyb_labels)), max(6, 0.45 * len(hyb_labels))))
+    sns.heatmap(
+        cm_hybrid,
+        annot=True,
+        fmt="d",
+        cmap="Purples",
+        ax=ax_h,
+        xticklabels=hyb_labels,
+        yticklabels=hyb_labels,
+        cbar_kws={"label": "Count"},
+    )
+    ax_h.set_xlabel("Predicted (hybrid)")
+    ax_h.set_ylabel("True class")
+    ax_h.set_title("Hybrid — Confusion matrix (test)")
+    plt.setp(ax_h.get_xticklabels(), rotation=35, ha="right")
+    plt.setp(ax_h.get_yticklabels(), rotation=0)
     plt.tight_layout()
     plt.show()
 
