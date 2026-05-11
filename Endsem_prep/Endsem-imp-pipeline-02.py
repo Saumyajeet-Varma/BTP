@@ -5,6 +5,10 @@
 #   Optional uniform [0,1]^d fakes — extra synthetic negatives for QA
 # Use probes to verify Stage 2 separates calibration normals vs synthetic "zero_day-like" signals.
 # Dataset: Car-Hacking (same features as pipeline-01)
+#
+# zero_day only applies when Stage 1 predicts Normal. Known attacks labeled DoS/Fuzzy/Gear/RPM never
+# become zero_day if Stage 1 is correct. Car-Hacking has no unknown class — expect few/zero zero_day
+# unless Stage 1 misses attacks (FN) and Stage 2 scores those misses above threshold.
 # ===============================
 
 try:
@@ -54,7 +58,13 @@ BATCH_SIZE = 256
 STAGE1_EPOCHS = 50
 STAGE1_PATIENCE = 8
 STAGE1_VAL_FRAC = 0.15
-STAGE2_NORMAL_PERCENTILE = 99.5
+# Percentile of *calibration* pipeline-normal scores → threshold (higher = stricter on benign FPR, fewer zero_day hits).
+# 99.5 is very conservative; Car-Hacking has no true "zero_day" class — zero_day only fires when Stage1 says Normal.
+STAGE2_NORMAL_PERCENTILE = 97.0
+# Fit recon/latent z-score stats from AAE training normals (recommended) vs same cal subset used for threshold.
+STAGE2_SCORE_STATS = "train_normal"  # "train_normal" | "cal_normal"
+# "blend" = weighted rs/ls; "max" = max(rs, ls) — more sensitive if either cue spikes (helps missed zero_day).
+STAGE2_SCORE_AGG = "max"  # "blend" | "max"
 
 AAE_EPOCHS = 180
 AAE_BATCH = 1024
@@ -341,17 +351,58 @@ def predict_stage1_labels(model, loader):
     return np.concatenate(out)
 
 
-def combined_scores(enc, dec, X_np, recon_mean, recon_std, lat_mean, lat_std):
+def compute_recon_lat_stats(enc, dec, X_np, batch_size=4096):
+    """Mean/std of reconstruction MSE and ||z|| on a reference normal set (e.g. AAE train normals)."""
     enc.eval()
     dec.eval()
-    x = torch.FloatTensor(X_np).to(device)
-    with torch.no_grad():
-        z = enc(x)
-        recon = dec(z)
-        recon_err = ((x - recon) ** 2).mean(dim=1).cpu().numpy()
-        lat_norm = torch.norm(z, dim=1).cpu().numpy()
+    recon_parts, lat_parts = [], []
+    for i in range(0, len(X_np), batch_size):
+        chunk = X_np[i : i + batch_size]
+        x = torch.FloatTensor(chunk).to(device)
+        with torch.no_grad():
+            z = enc(x)
+            recon = dec(z)
+            recon_parts.append(((x - recon) ** 2).mean(dim=1).cpu().numpy())
+            lat_parts.append(torch.norm(z, dim=1).cpu().numpy())
+    recon_all = np.concatenate(recon_parts)
+    lat_all = np.concatenate(lat_parts)
+    return (
+        float(recon_all.mean()),
+        float(recon_all.std() + 1e-8),
+        float(lat_all.mean()),
+        float(lat_all.std() + 1e-8),
+    )
+
+
+def combined_scores(
+    enc,
+    dec,
+    X_np,
+    recon_mean,
+    recon_std,
+    lat_mean,
+    lat_std,
+    score_agg=None,
+    batch_size=8192,
+):
+    score_agg = score_agg or STAGE2_SCORE_AGG
+    enc.eval()
+    dec.eval()
+    recon_parts, lat_parts = [], []
+    for i in range(0, len(X_np), batch_size):
+        chunk = X_np[i : i + batch_size]
+        x = torch.FloatTensor(chunk).to(device)
+        with torch.no_grad():
+            z = enc(x)
+            recon = dec(z)
+            recon_parts.append(((x - recon) ** 2).mean(dim=1).cpu().numpy())
+            lat_parts.append(torch.norm(z, dim=1).cpu().numpy())
+    recon_err = np.concatenate(recon_parts)
+    lat_norm = np.concatenate(lat_parts)
     rs = np.abs(recon_err - recon_mean) / recon_std
     ls = np.abs(lat_norm - lat_mean) / lat_std
+    if score_agg == "max":
+        return np.maximum(rs, ls)
     return (1.0 - LATENT_WEIGHT) * rs + LATENT_WEIGHT * ls
 
 
@@ -573,23 +624,25 @@ else:
         print("Warning: few Stage1-pass normals on cal; using all true cal normals.")
         pipeline_normal_mask = cal_normal_mask
 
-    with torch.no_grad():
-        xpn = torch.FloatTensor(X_cal[pipeline_normal_mask]).to(device)
-        zpn = enc(xpn)
-        rpn = dec(zpn)
-        val_recon_err = ((xpn - rpn) ** 2).mean(dim=1).cpu().numpy()
-        val_lat = torch.norm(zpn, dim=1).cpu().numpy()
+    cal_normal_X = X_cal[pipeline_normal_mask]
+    if STAGE2_SCORE_STATS == "train_normal":
+        recon_mean, recon_std, lat_mean, lat_std = compute_recon_lat_stats(enc, dec, Xn_tr)
+        stats_note = "recon/latent stats from AAE train normals (Xn_tr)"
+    else:
+        recon_mean, recon_std, lat_mean, lat_std = compute_recon_lat_stats(enc, dec, cal_normal_X)
+        stats_note = "recon/latent stats from cal pipeline normals"
 
-    recon_mean = val_recon_err.mean()
-    recon_std = val_recon_err.std() + 1e-8
-    lat_mean = val_lat.mean()
-    lat_std = val_lat.std() + 1e-8
-
-    val_scores = combined_scores(enc, dec, X_cal[pipeline_normal_mask], recon_mean, recon_std, lat_mean, lat_std)
+    val_scores = combined_scores(enc, dec, cal_normal_X, recon_mean, recon_std, lat_mean, lat_std)
     threshold = float(np.percentile(val_scores, STAGE2_NORMAL_PERCENTILE))
     print(
-        "\nStage 2 threshold ({} pct on cal normals | Stage1=Normal):".format(STAGE2_NORMAL_PERCENTILE),
-        round(threshold, 6),
+        "\nStage 2 — {} | score_agg={}".format(stats_note, STAGE2_SCORE_AGG),
+    )
+    print(
+        "Threshold: {:.6f} ({}th percentile of cal pipeline-normal scores, n={})".format(
+            threshold,
+            STAGE2_NORMAL_PERCENTILE,
+            len(val_scores),
+        ),
     )
 
     fake_gen = FakeSignalGenerator(dec, LATENT_DIM, FAKE_LATENT_STD).to(device)
@@ -647,6 +700,48 @@ else:
     pred_names = le.inverse_transform(y_test_pred)
     normal_str = le.classes_[normal_idx]
 
+    # --- Why zero_day can be rare on Car-Hacking (no true unknown class) ---
+    mask_s2_path = y_test_pred == normal_idx
+    n_on_s2_path = int(mask_s2_path.sum())
+    true_atk_on_s2 = (y_test != normal_idx) & mask_s2_path
+    n_true_atk_on_s2 = int(true_atk_on_s2.sum())
+    n_norm_on_s2 = int(((y_test == normal_idx) & mask_s2_path).sum())
+    flagged_on_s2 = (test_scores > threshold) & mask_s2_path
+    n_flagged_s2 = int(flagged_on_s2.sum())
+    print("\n" + "=" * 70)
+    print("STAGE 2 — zero_day eligibility (read this if hybrid rarely shows zero_day)")
+    print("=" * 70)
+    print(
+        "Test samples where Stage 1 predicts Normal (Stage 2 path): {} "
+        "({:.1%} of test)".format(n_on_s2_path, n_on_s2_path / max(len(y_test), 1))
+    )
+    print("  Of those: true Normal = {}, true attack (Stage 1 FN) = {}".format(n_norm_on_s2, n_true_atk_on_s2))
+    if n_true_atk_on_s2 > 0:
+        atk_scores = test_scores[true_atk_on_s2]
+        print(
+            "  True attacks on Stage 2 path: {:.1%} have score > threshold (can become zero_day)".format(
+                float(np.mean(atk_scores > threshold)),
+            )
+        )
+        print(
+            "    score mean {:.4f} vs threshold {:.4f}".format(float(np.mean(atk_scores)), threshold)
+        )
+    else:
+        print(
+            "  No true attack is predicted Normal — zero_day cannot appear for known attacks "
+            "(dataset has only known classes; zero_day is for unknown / Stage-1-FN traffic)."
+        )
+    print(
+        "  Cal pipeline-normal estimated FPR at this threshold: {:.2%} (fraction of cal scores > T)".format(
+            float(np.mean(val_scores > threshold)),
+        )
+    )
+    print(
+        "  On test Stage 2 path: {} samples flagged by score > T (includes true normals → hybrid FPs)".format(
+            n_flagged_s2,
+        )
+    )
+
     final_label = []
     for i in range(len(y_test)):
         if y_test_pred[i] != normal_idx:
@@ -656,6 +751,8 @@ else:
         else:
             final_label.append(normal_str)
     final_label = np.array(final_label)
+    n_hybrid_zero_day = int(np.sum(final_label == "zero_day"))
+    print("  Hybrid rows labeled zero_day: {}".format(n_hybrid_zero_day))
 
     true_is_attack = y_test != normal_idx
     hybrid_is_attack = final_label != normal_str
