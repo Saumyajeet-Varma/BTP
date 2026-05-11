@@ -1,0 +1,789 @@
+# ===============================
+# Endsem-imp-pipeline-02
+# Same two-stage pipeline as pipeline-01, plus:
+#   FakeSignalGenerator — Decoder(z), z ~ N(0, σ²I), yields synthetic [0,1]^d feature vectors
+#   Optional uniform [0,1]^d fakes — extra synthetic negatives for QA
+# Use probes to verify Stage 2 separates calibration normals vs synthetic "zero_day-like" signals.
+# Dataset: Car-Hacking (same features as pipeline-01)
+# ===============================
+
+try:
+    from google.colab import drive
+
+    drive.mount("/content/drive", force_remount=False)
+    _IN_COLAB = True
+except ImportError:
+    _IN_COLAB = False
+
+import os
+import re
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    precision_recall_fscore_support,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.utils.class_weight import compute_class_weight
+from torch.utils.data import DataLoader, TensorDataset
+
+warnings.filterwarnings("ignore")
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+torch.manual_seed(RANDOM_STATE)
+
+if _IN_COLAB:
+    data_path = "/content/drive/MyDrive/dataset/9) Car-Hacking Dataset"
+else:
+    data_path = r"9) Car-Hacking Dataset"
+
+USE_SUBSET = True
+MAX_NORMAL = 50_000
+MAX_PER_ATTACK_FILE = 50_000
+BATCH_SIZE = 256
+STAGE1_EPOCHS = 50
+STAGE1_PATIENCE = 8
+STAGE1_VAL_FRAC = 0.15
+STAGE2_NORMAL_PERCENTILE = 99.5
+
+AAE_EPOCHS = 180
+AAE_BATCH = 1024
+DISC_STEPS = 2
+INPUT_NOISE_STD = 0.01
+LATENT_DIM = 16
+LATENT_WEIGHT = 0.22
+
+NUM_FAKE_SAMPLES = 8000
+FAKE_LATENT_STD = 2.5
+INCLUDE_UNIFORM_FAKE = True
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0, label_smoothing=0.05):
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        if weight is not None:
+            self.register_buffer("ce_weight", weight)
+        else:
+            self.register_buffer("ce_weight", torch.empty(0))
+
+    def forward(self, logits, targets):
+        w = self.ce_weight if self.ce_weight.numel() > 0 else None
+        ce = nn.functional.cross_entropy(
+            logits, targets, weight=w, reduction="none", label_smoothing=self.label_smoothing
+        )
+        pt = torch.exp(-ce)
+        return ((1 - pt).pow(self.gamma) * ce).mean()
+
+
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        hid = max(channels // reduction, 4)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hid),
+            nn.ReLU(inplace=True),
+            nn.Linear(hid, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        se = self.fc(x.mean(dim=2)).unsqueeze(2)
+        return x * se
+
+
+class CANForgeStage1(nn.Module):
+    def __init__(self, n_features, num_classes):
+        super().__init__()
+        self.conv1 = nn.Sequential(nn.Conv1d(1, 32, 1, padding=0), nn.ReLU(), nn.BatchNorm1d(32))
+        self.conv3 = nn.Sequential(nn.Conv1d(1, 32, 3, padding=1), nn.ReLU(), nn.BatchNorm1d(32))
+        self.conv5 = nn.Sequential(nn.Conv1d(1, 32, 5, padding=2), nn.ReLU(), nn.BatchNorm1d(32))
+        self.drop1 = nn.Dropout(0.28)
+        self.se = SEBlock(96, reduction=4)
+        self.conv_res = nn.Sequential(nn.Conv1d(96, 96, 3, padding=1), nn.ReLU(), nn.BatchNorm1d(96))
+        self.drop2 = nn.Dropout(0.28)
+        self.lstm1 = nn.LSTM(96, 64, batch_first=True, bidirectional=True, dropout=0.28)
+        self.bn_lstm1 = nn.BatchNorm1d(128)
+        self.lstm2 = nn.LSTM(128, 64, batch_first=True, bidirectional=True, dropout=0.28)
+        self.bn_lstm2 = nn.BatchNorm1d(128)
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.38),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.28),
+            nn.Linear(64, num_classes),
+        )
+
+    def forward(self, x):
+        multi = torch.cat([self.conv1(x), self.conv3(x), self.conv5(x)], dim=1)
+        multi = self.drop1(self.se(multi))
+        res = torch.relu(self.conv_res(multi) + multi)
+        res = self.drop2(res)
+        lstm_in = res.permute(0, 2, 1)
+        o1, _ = self.lstm1(lstm_in)
+        o1 = self.bn_lstm1(o1.permute(0, 2, 1)).permute(0, 2, 1)
+        o2, _ = self.lstm2(o1)
+        o2 = self.bn_lstm2(o2.permute(0, 2, 1)).permute(0, 2, 1)
+        return self.classifier((o2 + o1).mean(dim=1))
+
+
+class Encoder(nn.Module):
+    def __init__(self, n_features, latent_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_features, 128),
+            nn.LayerNorm(128),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.05),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.05),
+            nn.Linear(64, latent_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Decoder(nn.Module):
+    def __init__(self, latent_dim, n_features):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.LayerNorm(64),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.05),
+            nn.Linear(64, 128),
+            nn.LayerNorm(128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, n_features),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+
+class LatentDiscriminator(nn.Module):
+    def __init__(self, latent_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.utils.spectral_norm(nn.Linear(latent_dim, 64)),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+            nn.utils.spectral_norm(nn.Linear(64, 32)),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+            nn.utils.spectral_norm(nn.Linear(32, 1)),
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+
+class FakeSignalGenerator(nn.Module):
+    """
+    Synthetic vectors x = Decoder(z), z ~ N(0, (latent_std)^2 I).
+    QA proxy for 'zero_day-like' probes — not logged CAN traffic.
+    """
+
+    def __init__(self, decoder, latent_dim, latent_std=2.0):
+        super().__init__()
+        self.decoder = decoder
+        self.latent_dim = latent_dim
+        self.latent_std = latent_std
+
+    @torch.no_grad()
+    def sample(self, n, dev):
+        self.decoder.eval()
+        z = torch.randn(n, self.latent_dim, device=dev) * self.latent_std
+        return self.decoder(z)
+
+    def sample_numpy(self, n, dev):
+        return self.sample(n, dev).cpu().numpy()
+
+
+def uniform_fake_features(n, n_features, rng=None):
+    rng = rng or np.random.RandomState(RANDOM_STATE)
+    return rng.uniform(0.0, 1.0, size=(n, n_features)).astype(np.float32)
+
+
+def parse_line(line):
+    regex = r"Timestamp:\s*(\d+\.\d+)\s+ID:\s*(\w+)\s+000\s+DLC:\s*(\d+)\s+([\da-fA-F\s]+)"
+    match = re.match(regex, line.strip())
+    if match:
+        timestamp = float(match.group(1))
+        can_id = int(match.group(2), 16)
+        dlc = int(match.group(3))
+        data = [int(byte, 16) for byte in match.group(4).split()]
+        data = (data + [0] * 8)[:8]
+        return {"Timestamp": timestamp, "CAN_ID": can_id, "DLC": dlc, "DATA": data}
+    return None
+
+
+def normal_txt_path(base):
+    p1 = os.path.join(base, "normal_run_data.txt")
+    p2 = os.path.join(base, "normal_run_data", "normal_run_data.txt")
+    if os.path.isfile(p1):
+        return p1
+    if os.path.isfile(p2):
+        return p2
+    return p1
+
+
+def load_full_dataframe(base_path, use_subset, max_normal, max_per_attack):
+    file_path = normal_txt_path(base_path)
+    rows = []
+    with open(file_path, "r") as f:
+        for line in f:
+            if use_subset and len(rows) >= max_normal:
+                break
+            p = parse_line(line)
+            if p:
+                rows.append(p)
+
+    df_normal = pd.DataFrame(rows)
+    for i in range(8):
+        df_normal["DATA{}".format(i)] = df_normal["DATA"].apply(lambda x, i=i: x[i] if i < len(x) else 0)
+    df_normal.drop(columns=["DATA"], inplace=True)
+    df_normal["Label"] = "Normal"
+
+    column_names = ["Timestamp", "CAN_ID", "DLC"] + ["DATA{}".format(i) for i in range(8)] + ["Flag"]
+
+    def hex_to_int(s):
+        s = str(s).strip()
+        if re.match(r"^[0-9a-fA-F]+$", s):
+            return int(s, 16)
+        return 0
+
+    def convert_numeric_columns(df, cols):
+        for col in cols:
+            if col == "CAN_ID" or col.startswith("DATA"):
+                df[col] = df[col].map(hex_to_int).astype(int)
+            else:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        return df
+
+    def label_from_flag(flag_series, attack_name):
+        return [
+            "Normal" if v == "R" else attack_name if v == "T" else "Normal"
+            for v in flag_series.astype(str).str.strip().str.upper()
+        ]
+
+    cols_to_process = ["CAN_ID", "DLC"] + ["DATA{}".format(i) for i in range(8)]
+    nrows = max_per_attack if use_subset else None
+    attack_files = [
+        ("dos_attack.csv", "DoS"),
+        ("fuzzy_attack.csv", "Fuzzy"),
+        ("gear_spoofing.csv", "Gear"),
+        ("rpm_spoofing.csv", "RPM"),
+    ]
+    parts = [df_normal]
+    for fname, aname in attack_files:
+        df = pd.read_csv(os.path.join(base_path, fname), header=None, names=column_names, nrows=nrows)
+        df = convert_numeric_columns(df, cols_to_process)
+        df["Label"] = label_from_flag(df["Flag"], aname)
+        parts.append(df)
+
+    full_df = pd.concat(parts, ignore_index=True)
+    if "Flag" in full_df.columns:
+        full_df.drop(columns=["Flag"], inplace=True)
+
+    base_features = ["CAN_ID", "DLC"] + ["DATA{}".format(i) for i in range(8)]
+    full_df = full_df.sort_values("Timestamp").reset_index(drop=True)
+    full_df["IAT"] = full_df["Timestamp"].diff().fillna(0).clip(upper=1.0)
+    freq = full_df["CAN_ID"].value_counts(normalize=True)
+    full_df["CAN_ID_freq"] = full_df["CAN_ID"].map(freq)
+    data_cols = ["DATA{}".format(i) for i in range(8)]
+
+    def row_entropy(row):
+        vals = row.values.astype(float)
+        vals = vals[vals > 0]
+        if len(vals) == 0:
+            return 0.0
+        p = vals / vals.sum()
+        p = p[p > 0]
+        return float(-np.sum(p * np.log2(p)))
+
+    full_df["byte_entropy"] = full_df[data_cols].apply(row_entropy, axis=1)
+    full_df["byte_sum"] = full_df[data_cols].sum(axis=1)
+    full_df["byte_range"] = full_df[data_cols].max(axis=1) - full_df[data_cols].min(axis=1)
+    full_df["byte_std"] = full_df[data_cols].std(axis=1)
+    features = base_features + ["IAT", "CAN_ID_freq", "byte_entropy", "byte_sum", "byte_range", "byte_std"]
+    return full_df, features
+
+
+def predict_stage1_labels(model, loader):
+    model.eval()
+    out = []
+    with torch.no_grad():
+        for xb, _ in loader:
+            xb = xb.to(device, non_blocking=True)
+            out.append(model(xb).argmax(1).cpu().numpy())
+    return np.concatenate(out)
+
+
+def combined_scores(enc, dec, X_np, recon_mean, recon_std, lat_mean, lat_std):
+    enc.eval()
+    dec.eval()
+    x = torch.FloatTensor(X_np).to(device)
+    with torch.no_grad():
+        z = enc(x)
+        recon = dec(z)
+        recon_err = ((x - recon) ** 2).mean(dim=1).cpu().numpy()
+        lat_norm = torch.norm(z, dim=1).cpu().numpy()
+    rs = np.abs(recon_err - recon_mean) / recon_std
+    ls = np.abs(lat_norm - lat_mean) / lat_std
+    return (1.0 - LATENT_WEIGHT) * rs + LATENT_WEIGHT * ls
+
+
+def train_stage1_classifier(model, train_loader, val_loader, class_weights, epochs, patience):
+    crit = FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=0.05)
+    opt = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    sched = optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=4)
+    best_vl = float("inf")
+    best_state = None
+    bad = 0
+    hist_train, hist_val = [], []
+    t0 = time.time()
+    for ep in range(epochs):
+        model.train()
+        tr_loss, tr_n = 0.0, 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            opt.zero_grad()
+            loss = crit(model(xb), yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tr_loss += loss.item() * xb.size(0)
+            tr_n += xb.size(0)
+        tr_loss /= max(tr_n, 1)
+        model.eval()
+        vl_loss, vl_n = 0.0, 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+                vl_loss += crit(model(xb), yb).item() * xb.size(0)
+                vl_n += xb.size(0)
+        vl_loss /= max(vl_n, 1)
+        hist_train.append(tr_loss)
+        hist_val.append(vl_loss)
+        sched.step(vl_loss)
+        if vl_loss < best_vl:
+            best_vl = vl_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+        if bad >= patience:
+            break
+    if best_state:
+        model.load_state_dict(best_state)
+    return time.time() - t0, hist_train, hist_val
+
+
+def train_stage2_aae(enc, dec, disc, X_normal_np, X_norm_val_t, ae_loss_log):
+    opt_ae = optim.AdamW(list(enc.parameters()) + list(dec.parameters()), lr=8e-4, weight_decay=1e-4)
+    opt_disc = optim.AdamW(disc.parameters(), lr=2e-4, betas=(0.5, 0.9), weight_decay=1e-4)
+    opt_gen = optim.AdamW(enc.parameters(), lr=2e-4, betas=(0.5, 0.9), weight_decay=1e-4)
+    sched_ae = optim.lr_scheduler.ReduceLROnPlateau(opt_ae, mode="min", factor=0.5, patience=8, min_lr=1e-5)
+    recon_loss_fn = nn.SmoothL1Loss(beta=0.05)
+    adv_loss_fn = nn.BCEWithLogitsLoss()
+    loader = DataLoader(
+        TensorDataset(torch.FloatTensor(X_normal_np)),
+        batch_size=AAE_BATCH,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=0,
+    )
+    best_mse = float("inf")
+    best_pack = (None, None, None)
+    pat = 0
+    t0 = time.time()
+    for _epoch in range(AAE_EPOCHS):
+        enc.train()
+        dec.train()
+        disc.train()
+        ep_ae = 0.0
+        nb = 0
+        for (real_cpu,) in loader:
+            real = real_cpu.to(device, non_blocking=True)
+            noisy = (real + INPUT_NOISE_STD * torch.randn_like(real)).clamp(0.0, 1.0)
+            bs = real.size(0)
+            z = enc(noisy)
+            recon = dec(z)
+            ae_loss = recon_loss_fn(recon, real)
+            opt_ae.zero_grad()
+            ae_loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(enc.parameters()) + list(dec.parameters()), 1.0)
+            opt_ae.step()
+            for _ in range(DISC_STEPS):
+                z_real = torch.randn(bs, LATENT_DIM, device=device)
+                z_fake = enc(real).detach()
+                d_loss = 0.5 * (
+                    adv_loss_fn(disc(z_real), torch.full((bs, 1), 0.9, device=device))
+                    + adv_loss_fn(disc(z_fake), torch.full((bs, 1), 0.1, device=device))
+                )
+                opt_disc.zero_grad()
+                d_loss.backward()
+                torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
+                opt_disc.step()
+            z_adv = enc(real)
+            g_loss = adv_loss_fn(disc(z_adv), torch.full((bs, 1), 0.9, device=device))
+            opt_gen.zero_grad()
+            g_loss.backward()
+            torch.nn.utils.clip_grad_norm_(enc.parameters(), 1.0)
+            opt_gen.step()
+            ep_ae += ae_loss.item()
+            nb += 1
+        ae_loss_log.append(ep_ae / max(nb, 1))
+        enc.eval()
+        dec.eval()
+        with torch.no_grad():
+            vz = enc(X_norm_val_t)
+            vr = dec(vz)
+            val_mse = ((X_norm_val_t - vr) ** 2).mean(dim=1).mean().item()
+        sched_ae.step(val_mse)
+        if val_mse < best_mse:
+            best_mse = val_mse
+            best_pack = (
+                {k: v.detach().clone() for k, v in enc.state_dict().items()},
+                {k: v.detach().clone() for k, v in dec.state_dict().items()},
+                {k: v.detach().clone() for k, v in disc.state_dict().items()},
+            )
+            pat = 0
+        else:
+            pat += 1
+        if pat >= 18:
+            break
+    if best_pack[0] is not None:
+        enc.load_state_dict(best_pack[0])
+        dec.load_state_dict(best_pack[1])
+        disc.load_state_dict(best_pack[2])
+    return time.time() - t0, best_mse
+
+
+if not os.path.isdir(data_path):
+    print("ERROR: Dataset not found at:", repr(data_path))
+else:
+    full_df, features = load_full_dataframe(data_path, USE_SUBSET, MAX_NORMAL, MAX_PER_ATTACK_FILE)
+    X = full_df[features].values
+    y_str = full_df["Label"].values
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y_str)
+    num_classes = len(le.classes_)
+    normal_idx = int(le.transform(["Normal"])[0])
+    N_FEATURES = len(features)
+    print("N_FEATURES:", N_FEATURES, "| Classes:", list(le.classes_))
+
+    X_trf, X_test, y_trf, y_test = train_test_split(
+        X, y_enc, test_size=0.2, random_state=RANDOM_STATE, stratify=y_enc
+    )
+    scaler = MinMaxScaler()
+    X_trf_s = scaler.fit_transform(X_trf)
+    X_test_s = scaler.transform(X_test)
+
+    X_train, X_cal, y_train, y_cal = train_test_split(
+        X_trf_s, y_trf, test_size=STAGE1_VAL_FRAC, random_state=RANDOM_STATE, stratify=y_trf
+    )
+
+    X_train_t = torch.FloatTensor(X_train).unsqueeze(1)
+    y_train_t = torch.LongTensor(y_train)
+    X_cal_t = torch.FloatTensor(X_cal).unsqueeze(1)
+    X_test_t = torch.FloatTensor(X_test_s).unsqueeze(1)
+
+    train_loader = DataLoader(
+        TensorDataset(X_train_t, y_train_t), batch_size=BATCH_SIZE, shuffle=True, pin_memory=True
+    )
+    cal_loader = DataLoader(
+        TensorDataset(X_cal_t, torch.LongTensor(y_cal)), batch_size=BATCH_SIZE * 2, shuffle=False, pin_memory=True
+    )
+    test_loader = DataLoader(
+        TensorDataset(X_test_t, torch.LongTensor(y_test)), batch_size=BATCH_SIZE * 2, shuffle=False, pin_memory=True
+    )
+
+    cw = compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
+    class_weights = torch.FloatTensor(cw).to(device)
+
+    stage1_model = CANForgeStage1(N_FEATURES, num_classes).to(device)
+    print("\n--- Stage 1: CANForge-style classifier ---")
+    t_stage1, hist_s1_tr, hist_s1_val = train_stage1_classifier(
+        stage1_model, train_loader, cal_loader, class_weights, STAGE1_EPOCHS, STAGE1_PATIENCE
+    )
+    print("Stage 1 training time (s):", round(t_stage1, 1))
+
+    y_cal_pred = predict_stage1_labels(stage1_model, cal_loader)
+    y_test_pred = predict_stage1_labels(stage1_model, test_loader)
+
+    acc1 = accuracy_score(y_test, y_test_pred)
+    p1w, r1w, f1w, _ = precision_recall_fscore_support(
+        y_test, y_test_pred, average="weighted", zero_division=0
+    )
+    p1m, r1m, f1m, _ = precision_recall_fscore_support(
+        y_test, y_test_pred, average="macro", zero_division=0
+    )
+    cm1 = confusion_matrix(y_test, y_test_pred, labels=np.arange(num_classes))
+    print("\n" + "=" * 70)
+    print("STAGE 1 — Multi-class classifier (test set)")
+    print("=" * 70)
+    print(
+        "Accuracy: {:.4f} | Precision (w): {:.4f} | Recall (w): {:.4f} | F1 (w): {:.4f}".format(acc1, p1w, r1w, f1w)
+    )
+    print("Precision (macro): {:.4f} | Recall (macro): {:.4f} | F1 (macro): {:.4f}".format(p1m, r1m, f1m))
+    print(classification_report(y_test, y_test_pred, target_names=le.classes_, zero_division=0))
+    print("Confusion matrix | order:", list(le.classes_))
+    print(cm1)
+
+    X_normal_train = X_train[y_train == normal_idx]
+    Xn_tr, Xn_val = train_test_split(X_normal_train, test_size=0.12, random_state=RANDOM_STATE)
+    X_norm_val_t = torch.FloatTensor(Xn_val).to(device)
+
+    enc = Encoder(N_FEATURES, LATENT_DIM).to(device)
+    dec = Decoder(LATENT_DIM, N_FEATURES).to(device)
+    disc = LatentDiscriminator(LATENT_DIM).to(device)
+
+    ae_curve = []
+    print("\n--- Stage 2: AAE on normal-only train ---")
+    t_stage2, best_val_mse = train_stage2_aae(enc, dec, disc, Xn_tr, X_norm_val_t, ae_curve)
+    print("Stage 2 training time (s):", round(t_stage2, 1), "| best val MSE:", round(best_val_mse, 6))
+
+    cal_normal_mask = y_cal == normal_idx
+    passed_s1 = y_cal_pred == normal_idx
+    pipeline_normal_mask = cal_normal_mask & passed_s1
+    if pipeline_normal_mask.sum() < 50:
+        print("Warning: few Stage1-pass normals on cal; using all true cal normals.")
+        pipeline_normal_mask = cal_normal_mask
+
+    with torch.no_grad():
+        xpn = torch.FloatTensor(X_cal[pipeline_normal_mask]).to(device)
+        zpn = enc(xpn)
+        rpn = dec(zpn)
+        val_recon_err = ((xpn - rpn) ** 2).mean(dim=1).cpu().numpy()
+        val_lat = torch.norm(zpn, dim=1).cpu().numpy()
+
+    recon_mean = val_recon_err.mean()
+    recon_std = val_recon_err.std() + 1e-8
+    lat_mean = val_lat.mean()
+    lat_std = val_lat.std() + 1e-8
+
+    val_scores = combined_scores(enc, dec, X_cal[pipeline_normal_mask], recon_mean, recon_std, lat_mean, lat_std)
+    threshold = float(np.percentile(val_scores, STAGE2_NORMAL_PERCENTILE))
+    print(
+        "\nStage 2 threshold ({} pct on cal normals | Stage1=Normal):".format(STAGE2_NORMAL_PERCENTILE),
+        round(threshold, 6),
+    )
+
+    fake_gen = FakeSignalGenerator(dec, LATENT_DIM, FAKE_LATENT_STD).to(device)
+    fake_decoder_np = fake_gen.sample_numpy(NUM_FAKE_SAMPLES, device)
+    fake_scores_dec = combined_scores(
+        enc, dec, fake_decoder_np, recon_mean, recon_std, lat_mean, lat_std
+    )
+    fake_scores_uni = None
+    if INCLUDE_UNIFORM_FAKE:
+        fake_uniform_np = uniform_fake_features(NUM_FAKE_SAMPLES, N_FEATURES)
+        fake_scores_uni = combined_scores(
+            enc, dec, fake_uniform_np, recon_mean, recon_std, lat_mean, lat_std
+        )
+
+    print("\n" + "=" * 70)
+    print("STAGE 2 — Synthetic probes (decoder fakes = proxy zero_day-like QA)")
+    print("=" * 70)
+    print(
+        "Decoder-fake: mean score {:.4f} | {:.1%} flagged (score > T)".format(
+            float(np.mean(fake_scores_dec)),
+            float(np.mean(fake_scores_dec > threshold)),
+        )
+    )
+    if fake_scores_uni is not None:
+        print(
+            "Uniform [0,1]^d fake: mean {:.4f} | {:.1%} flagged".format(
+                float(np.mean(fake_scores_uni)),
+                float(np.mean(fake_scores_uni > threshold)),
+            )
+        )
+    print(
+        "Cal normals (Stage1-pass): mean {:.4f} | {:.1%} pass (score <= T)".format(
+            float(np.mean(val_scores)),
+            float(np.mean(val_scores <= threshold)),
+        )
+    )
+
+    n_bal = min(len(val_scores), len(fake_scores_dec))
+    rng_chk = np.random.RandomState(RANDOM_STATE)
+    idx_bal = rng_chk.choice(len(val_scores), size=n_bal, replace=False)
+    ver_true = np.array([0] * n_bal + [1] * n_bal)
+    ver_scores_cat = np.concatenate([val_scores[idx_bal], fake_scores_dec[:n_bal]])
+    ver_pred = (ver_scores_cat > threshold).astype(int)
+    acc_ver = accuracy_score(ver_true, ver_pred)
+    pv, rv, fv, _ = precision_recall_fscore_support(
+        ver_true, ver_pred, average="binary", pos_label=1, zero_division=0
+    )
+    print("\nBalanced QA (n={} vs {}): real_normal_cal vs decoder_fake".format(n_bal, n_bal))
+    print("Accuracy: {:.4f} | Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}".format(acc_ver, pv, rv, fv))
+    print(classification_report(ver_true, ver_pred, labels=[0, 1], target_names=["real_normal_cal", "decoder_fake"], zero_division=0))
+    cm_syn = confusion_matrix(ver_true, ver_pred, labels=[0, 1])
+    print(cm_syn)
+
+    test_scores = combined_scores(enc, dec, X_test_s, recon_mean, recon_std, lat_mean, lat_std)
+    pred_names = le.inverse_transform(y_test_pred)
+    normal_str = le.classes_[normal_idx]
+
+    final_label = []
+    for i in range(len(y_test)):
+        if y_test_pred[i] != normal_idx:
+            final_label.append(pred_names[i])
+        elif test_scores[i] > threshold:
+            final_label.append("zero_day")
+        else:
+            final_label.append(normal_str)
+    final_label = np.array(final_label)
+
+    true_is_attack = y_test != normal_idx
+    hybrid_is_attack = final_label != normal_str
+    h_acc = accuracy_score(true_is_attack, hybrid_is_attack)
+    hp, hr, hf1, _ = precision_recall_fscore_support(true_is_attack, hybrid_is_attack, average="binary")
+
+    tn_mask = y_test == normal_idx
+    normal_cleared = (final_label[tn_mask] == normal_str).mean() if tn_mask.any() else 0.0
+    normal_fpr = (final_label[tn_mask] != normal_str).mean() if tn_mask.any() else 0.0
+
+    print("\n" + "=" * 70)
+    print("STAGE 2 — Gated test (Stage1 predicted Normal)")
+    print("=" * 70)
+    s2_mask = y_test_pred == normal_idx
+    n_s2 = int(s2_mask.sum())
+    if n_s2 == 0:
+        cm_s2 = np.zeros((2, 2), dtype=int)
+        acc_s2 = float("nan")
+        p2 = r2 = f2 = float("nan")
+    else:
+        y_s2_true = (y_test[s2_mask] != normal_idx).astype(int)
+        y_s2_pred = (test_scores[s2_mask] > threshold).astype(int)
+        acc_s2 = accuracy_score(y_s2_true, y_s2_pred)
+        p2, r2, f2, _ = precision_recall_fscore_support(
+            y_s2_true, y_s2_pred, average="binary", pos_label=1, zero_division=0
+        )
+        print("Samples on Stage-2 path:", n_s2)
+        print("Accuracy: {:.4f} | Precision: {:.4f} | Recall: {:.4f} | F1: {:.4f}".format(acc_s2, p2, r2, f2))
+        print(classification_report(y_s2_true, y_s2_pred, labels=[0, 1], target_names=["true_normal", "true_attack"], zero_division=0))
+        cm_s2 = confusion_matrix(y_s2_true, y_s2_pred, labels=[0, 1])
+        print(cm_s2)
+
+    print("\n" + "=" * 70)
+    print("HYBRID — True vs predicted")
+    print("=" * 70)
+    true_names = le.inverse_transform(y_test)
+    hyb_labels = sorted(set(true_names.tolist()) | set(final_label.tolist()))
+    acc_hybrid = accuracy_score(true_names, final_label)
+    ph_m, rh_m, fh_m, _ = precision_recall_fscore_support(
+        true_names, final_label, labels=hyb_labels, average="macro", zero_division=0
+    )
+    ph_w, rh_w, fh_w, _ = precision_recall_fscore_support(
+        true_names, final_label, labels=hyb_labels, average="weighted", zero_division=0
+    )
+    print(
+        "Accuracy: {:.4f} | P/R/F1 (macro): {:.4f} / {:.4f} / {:.4f}".format(acc_hybrid, ph_m, rh_m, fh_m)
+    )
+    print("P/R/F1 (weighted): {:.4f} / {:.4f} / {:.4f}".format(ph_w, rh_w, fh_w))
+    print(classification_report(true_names, final_label, labels=hyb_labels, zero_division=0))
+    cm_hybrid = confusion_matrix(true_names, final_label, labels=hyb_labels)
+    print(hyb_labels)
+    print(cm_hybrid)
+
+    print("\nHYBRID binary | Normal cleared: {:.2%} | Stage2 FP on normals: {:.2%}".format(normal_cleared, normal_fpr))
+    print("Binary attack detection Acc: {:.4f} | P: {:.4f} | R: {:.4f} | F1: {:.4f}".format(h_acc, hp, hr, hf1))
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    plt.rcParams["figure.figsize"] = (10, 6)
+    plt.rcParams["font.size"] = 10
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(range(1, len(hist_s1_tr) + 1), hist_s1_tr, "b-", label="Train")
+    ax.plot(range(1, len(hist_s1_val) + 1), hist_s1_val, "b--", label="Val")
+    ax.set_title("Stage 1 loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+    sns.heatmap(cm1, annot=True, fmt="d", cmap="Blues", ax=ax, xticklabels=le.classes_, yticklabels=le.classes_)
+    ax.set_title("Stage 1 confusion")
+    plt.tight_layout()
+    plt.show()
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(range(1, len(ae_curve) + 1), ae_curve, color="darkgreen")
+    ax.set_title("Stage 2 AE recon loss / epoch")
+    plt.tight_layout()
+    plt.show()
+
+    sc_normal = test_scores[y_test == normal_idx]
+    sc_attack = test_scores[y_test != normal_idx]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    if len(sc_normal):
+        ax.hist(sc_normal, bins=50, alpha=0.55, label="Normal", color="green", density=True, edgecolor="black", linewidth=0.3)
+    if len(sc_attack):
+        ax.hist(sc_attack, bins=50, alpha=0.55, label="Attack", color="red", density=True, edgecolor="black", linewidth=0.3)
+    ax.axvline(threshold, color="black", linestyle="--", linewidth=2, label="Threshold")
+    ax.set_title("Stage 2 scores (test)")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(val_scores, bins=45, alpha=0.5, label="Cal normals", color="green", density=True, edgecolor="black", linewidth=0.2)
+    ax.hist(fake_scores_dec, bins=45, alpha=0.5, label="Decoder fake (QA)", color="orange", density=True, edgecolor="black", linewidth=0.2)
+    if fake_scores_uni is not None:
+        ax.hist(fake_scores_uni, bins=45, alpha=0.45, label="Uniform fake", color="purple", density=True, edgecolor="black", linewidth=0.2)
+    ax.axvline(threshold, color="black", linestyle="--", linewidth=2, label="Threshold")
+    ax.set_title("Stage 2 — calibration normals vs synthetic fakes")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+    if n_s2 > 0:
+        fig, ax = plt.subplots(figsize=(5.5, 4.5))
+        sns.heatmap(
+            cm_s2,
+            annot=True,
+            fmt="d",
+            cmap="Oranges",
+            ax=ax,
+            xticklabels=["pass", "flag"],
+            yticklabels=["true_norm", "true_atk"],
+        )
+        plt.tight_layout()
+        plt.show()
+
+    hyb_fig_w = max(8.0, 0.55 * len(hyb_labels))
+    hyb_fig_h = max(6.0, 0.5 * len(hyb_labels))
+    _, ax_h = plt.subplots(figsize=(hyb_fig_w, hyb_fig_h))
+    sns.heatmap(cm_hybrid, annot=True, fmt="d", cmap="Purples", ax=ax_h, xticklabels=hyb_labels, yticklabels=hyb_labels)
+    ax_h.set_title("Hybrid confusion")
+    plt.setp(ax_h.get_xticklabels(), rotation=30, ha="right")
+    plt.tight_layout()
+    plt.show()
+
+    print("\nDone (pipeline-02): Stage1 -> attacks|Normal; Stage2 + decoder/uniform fake QA + hybrid zero_day.")
