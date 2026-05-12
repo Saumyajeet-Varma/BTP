@@ -25,10 +25,23 @@ import os
 import re
 import warnings
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import tensorflow as tf
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_recall_fscore_support,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.utils.class_weight import compute_class_weight
@@ -250,6 +263,11 @@ def build_all_windows(data_path):
 
 
 def build_model(seq_len, n_features, num_classes):
+    """
+    Two-stage deep head (single end-to-end model):
+      Stage 1 — Conv1D stack: local temporal patterns along SEQ_LEN.
+      Stage 2 — Bi-temporal LSTM + MLP: sequence summary -> 5-class softmax.
+    """
     inp = Input(shape=(seq_len, n_features))
     x = Conv1D(64, 3, padding="same", activation="relu")(inp)
     x = BatchNormalization()(x)
@@ -335,12 +353,69 @@ else:
     pred_labels = le.inverse_transform(pred_enc)
     true_labels = le.inverse_transform(true_enc)
 
-    print("\nAccuracy:", accuracy_score(true_labels, pred_labels))
-    print("\nConfusion matrix (rows=true, cols=pred):")
     labels_order = list(le.classes_)
+    cm = confusion_matrix(true_labels, pred_labels, labels=labels_order)
+
+    acc = accuracy_score(true_labels, pred_labels)
+    prec_macro = precision_score(true_labels, pred_labels, average="macro", zero_division=0)
+    rec_macro = recall_score(true_labels, pred_labels, average="macro", zero_division=0)
+    f1_macro = f1_score(true_labels, pred_labels, average="macro", zero_division=0)
+    prec_weighted = precision_score(true_labels, pred_labels, average="weighted", zero_division=0)
+    rec_weighted = recall_score(true_labels, pred_labels, average="weighted", zero_division=0)
+    f1_weighted = f1_score(true_labels, pred_labels, average="weighted", zero_division=0)
+
+    print("\n========== Overall metrics ==========")
+    print("Accuracy:           {:.4f}".format(acc))
+    print("Precision (macro): {:.4f}   (weighted): {:.4f}".format(prec_macro, prec_weighted))
+    print("Recall (macro):     {:.4f}   (weighted): {:.4f}".format(rec_macro, rec_weighted))
+    print("F1-score (macro):   {:.4f}   (weighted): {:.4f}".format(f1_macro, f1_weighted))
+
+    p_per, r_per, f1_per, sup_per = precision_recall_fscore_support(
+        true_labels, pred_labels, labels=labels_order, zero_division=0
+    )
+    print("\n========== Per-class (precision, recall, F1, support) ==========")
+    for i, lab in enumerate(labels_order):
+        print(
+            "  {:8s}  P={:.4f}  R={:.4f}  F1={:.4f}  n={}".format(
+                lab, p_per[i], r_per[i], f1_per[i], int(sup_per[i])
+            )
+        )
+
+    print("\nConfusion matrix (rows=true, cols=pred):")
     print(labels_order)
-    print(confusion_matrix(true_labels, pred_labels, labels=labels_order))
+    print(cm)
+
     print("\nClassification report:")
     print(classification_report(true_labels, pred_labels, labels=labels_order, digits=4))
 
-    print("\n--- Done. DoS should show non-zero recall vs AE-gated notebook pipeline. ---")
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        script_dir = os.getcwd()
+    cm_path = os.path.join(script_dir, "midsem_model_improvised_confusion_matrix.png")
+    fig, ax = plt.subplots(figsize=(9, 7))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=labels_order,
+        yticklabels=labels_order,
+        ax=ax,
+        cbar_kws={"label": "Count"},
+    )
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(
+        "Midsem improvised IDS — confusion matrix\nAcc={:.4f}  macro P/R/F1={:.3f}/{:.3f}/{:.3f}".format(
+            acc, prec_macro, rec_macro, f1_macro
+        )
+    )
+    plt.xticks(rotation=25, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(cm_path, dpi=150)
+    plt.close(fig)
+    print("\nSaved confusion matrix figure:", cm_path)
+
+    print("\n--- Done. ---")
