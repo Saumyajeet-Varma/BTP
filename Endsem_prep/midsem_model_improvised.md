@@ -1,152 +1,101 @@
-# `midsem_model_improvised.py` — pipeline and model stages
+# `midsem_model_improvised.py` — two-stage IDS + GAN → `zero_day`
 
-This document describes the **end-to-end working** of `midsem_model_improvised.py`: how data flows from raw Car-Hacking files to predictions, how **Stage 1** and **Stage 2** inside the neural network behave, and how that compares to the two-stage design in `codes/IDS_new_pipeline.ipynb`.
-
----
-
-## 1. Purpose
-
-The script trains an **intrusion detection** model on the **Car-Hacking** dataset: five classes — **Normal**, **DoS**, **Fuzzy**, **Gear**, **RPM**. It is an improvised alternative to the notebook pipeline that had **DoS recall collapsed to zero** because an autoencoder gate treated many DoS frames as “normal-looking” in payload space.
-
-Here, **one Keras model** maps a **fixed-length CAN window** directly to a **5-way softmax**. There is **no** separate autoencoder overriding the class label at inference time.
+This document matches the current script: a **two-stage pipeline** on Car-Hacking sliding windows, a **GAN** that synthesises fake CAN-like windows, and a **sixth label** `zero_day` for anomalies (including GAN fakes) caught by Stage 2.
 
 ---
 
-## 2. High-level pipeline (what runs, in order)
+## 1. Labels (6)
 
-The script is structured as a **linear pipeline** after optional Colab `drive.mount`:
+| Label | Meaning |
+|--------|---------|
+| **Normal** | Benign traffic (ground truth from normal file or `Flag == R` in attack CSVs). |
+| **DoS**, **Fuzzy**, **Gear**, **RPM** | Known attacks from the dataset. |
+| **zero_day** | Not one of the four known attacks *in the hybrid decision*: either **GAN-generated** windows used only in evaluation, or **true Normal** mis-scored by the autoencoder (false alarm), or rare AE-high cases on real Normal. |
 
-| Step | What happens |
-|------|----------------|
-| **A. Paths & seeds** | `data_path` (Colab Drive or local `9) Car-Hacking Dataset`), `RANDOM_STATE`, TensorFlow seed. |
-| **B. Load streams** | Normal traffic from `normal_run_data.txt` (with row cap). Each attack from a CSV (`DoS_dataset.csv` or `dos_attack.csv`, etc.). |
-| **C. Row labels** | Attack CSVs use `Flag`: `R` → Normal segment inside that recording, `T` → attack type for that file. |
-| **D. Feature engineering** | Per stream, sort by `Timestamp`, then add derived columns (IAT, ID frequency, byte statistics). |
-| **E. Sliding windows** | For each stream alone: build tensors of shape `(N, SEQ_LEN, n_features)`; label = class at the **last** timestep of the window. |
-| **F. Concatenate** | All windows from all streams are stacked into one dataset. |
-| **G. Encode labels** | `LabelEncoder` → integers → `to_categorical` one-hot for Keras. |
-| **H. Scale** | `MinMaxScaler` on flattened windows, then reshape back to `(N, SEQ_LEN, n_features)`. |
-| **I. Split** | Stratified `train_test_split` (80% train, 20% test) on window labels. |
-| **J. Class weights** | `compute_class_weight('balanced')` on training labels to reduce bias toward Normal. |
-| **K. Build & train model** | Two-stage CNN–RNN architecture (details below), Adam, categorical cross-entropy, early stopping + LR schedule. |
-| **L. Evaluate** | Accuracy; macro and weighted precision, recall, F1; per-class P/R/F1/support; confusion matrix **printed** and **saved as a heatmap PNG**. |
-
-Output figure path (same folder as the script, or current working directory if `__file__` is unavailable):
-
-`midsem_model_improvised_confusion_matrix.png`
+Ground-truth `zero_day` in the script is assigned **only to GAN-generated test windows**. Real Normal / known attacks keep their dataset labels for metrics.
 
 ---
 
-## 3. Data loading (streams, not one shuffled bag of rows)
+## 2. End-to-end pipeline
 
-**Normal:** lines are parsed with a regex into `Timestamp`, `CAN_ID`, `DLC`, eight data bytes; `DATA0`…`DATA7` are expanded; every row is labeled `Normal`. A subset cap `MAX_NORMAL` applies when `USE_SUBSET` is true.
+1. **Load streams** — Same as before: normal text log + four attack CSVs (with alternate filenames). Per-stream time sort and sliding windows (`SEQ_LEN`).
 
-**Attacks:** each file is read with fixed column names; hex fields are converted to integers; `label_from_flag` assigns `Normal` or the file’s attack name from `Flag`.
+2. **Features** — Base CAN fields plus IAT, ID frequency, byte entropy / sum / range / std.
 
-**Why per-file windows:** Windows are built **inside each dataframe** after sorting by `Timestamp`. That way a window is a short **contiguous slice of one recording**, not an arbitrary mix of unrelated timestamps from different files.
+3. **Scale** — `MinMaxScaler` on flattened window → reshape to `(N, SEQ_LEN, n_features)`; flattened dimension `flat_dim = SEQ_LEN * n_features` for AE and GAN.
 
----
+4. **Train / test split (real data only)** — 80 / 20 stratified on **five** classes (Normal + four attacks). Stage 1 is trained only on this.
 
-## 4. Feature engineering (`add_engineered_features`)
+5. **Stage 1 — Known attack classifier (5 classes)**  
+   - CNN + stacked LSTM + Dense → **softmax over {Normal, DoS, Fuzzy, Gear, RPM}**.  
+   - Class-balanced weights.  
+   - **Output:** `midsem_cm_stage1.png` (heatmap) + printed accuracy, precision, recall, F1 (macro / weighted + `classification_report`).
 
-Base features match the notebook spirit: `CAN_ID`, `DLC`, `DATA0`…`DATA7`.
+6. **Stage 2 — Autoencoder (anomaly score on “Normal” from training)**  
+   - Trained on **flattened windows** that are **true Normal** in the **training** split only (reconstruction targets = input).  
+   - **Score:** per-window MSE between input and reconstruction.  
+   - **Threshold:** starts at a high percentile of MSE on **train Normal**; then adjusted using **GAN probe** MSEs so a large fraction of synthetic fakes lies above the threshold (hybrid between percentile of real normals and GAN distribution).
 
-**Added columns:**
+7. **GAN — fake normal-like windows**  
+   - **Generator:** noise → MLP → `sigmoid` vector of length `flat_dim` in `[0,1]` (same space as scaled real windows).  
+   - **Discriminator:** real vs fake on flat vectors.  
+   - Trained on **train Normal** flats only (generator tries to fool D while D tries to detect fakes).  
+   - After training, **`NUM_GAN_TEST_WINDOWS`** samples are drawn for evaluation with **true label `zero_day`**.
 
-- **`IAT` (inter-arrival time):** difference between consecutive timestamps, clipped to `[0, 1]` seconds. Captures **burstiness** (important for DoS).
-- **`CAN_ID_freq`:** relative frequency of that ID inside **this** stream — common IDs get higher values.
-- **`byte_entropy`:** Shannon entropy of non-zero byte values in the payload — fuzzy / random payloads often differ from steady operational payloads.
-- **`byte_sum`, `byte_range`, `byte_std`:** simple payload summaries.
+8. **Hybrid inference (final 6-way decision)**  
+   - Run **Stage 1** on every window.  
+   - If argmax ≠ **Normal** → final label = that **known attack** (Stage 2 is skipped).  
+   - If argmax = **Normal** → run **AE** on the flat window: if MSE **>** threshold → **`zero_day`**, else **Normal**.
 
-These are computed **after** sorting by time so IAT is meaningful.
+9. **Evaluation sets**  
+   - **Real test windows** (same 5-way labels as data).  
+   - **GAN windows** appended with true label **`zero_day`**.  
+   - **Final metrics** over **all** of these with fixed label order `FINAL_LABELS` → `midsem_cm_final_hybrid.png`.
 
----
-
-## 5. Sliding windows (`make_windows_from_sorted_df`)
-
-- Input: one sorted stream + base column list + `SEQ_LEN` (default 24).
-- For each start index `i`, the window is rows `i … i+SEQ_LEN-1`, shape `(SEQ_LEN, n_features)`.
-- **Label:** the label of row `i+SEQ_LEN-1` (last frame in the window). That ties the prediction to “what is happening **now** given the recent context.”
-
-Output: `X_w` of shape `(num_windows, SEQ_LEN, n_features)` and parallel string labels.
-
----
-
-## 6. Stage 1 and Stage 2 **inside this script’s model**
-
-The improvised script uses **one `Model` object**, but it is built as **two conceptual stages** (implemented in `build_model`). This is the right place to use the words “Stage 1” and “Stage 2” for **this** codebase.
-
-### Stage 1 — Convolutional temporal front-end
-
-**Layers:** `Conv1D(64) → BatchNorm → MaxPool1D → Dropout → Conv1D(128) → BatchNorm → MaxPool1D → Dropout`.
-
-**Input tensor shape:** `(batch, SEQ_LEN, n_features)` — think of `SEQ_LEN` as time steps and `n_features` as channels per step (like a multivariate time series).
-
-**What it does:**
-
-- Each `Conv1D` slides **small temporal kernels** (size 3) along the sequence. At each position it mixes **neighbouring timesteps** and **all feature channels** into new feature maps.
-- **Batch normalization** stabilizes scale across the batch; **max pooling** downsamples time so higher layers see **wider receptive fields** with fewer steps.
-- **Dropout** reduces overfitting.
-
-**Intuition:** Stage 1 learns **local motifs** in the CAN window — e.g. short bursts of IDs, rapid changes in IAT, local payload patterns — without yet collapsing the whole window to a single vector.
-
-**Tensor flow:** `(B, T, F) → (B, T', C128)` after pools (length `T'` is shorter than `T`).
-
-### Stage 2 — Recurrent sequence model + classifier head
-
-**Layers:** `LSTM(96, return_sequences=True) → Dropout → LSTM(64, return_sequences=False) → BatchNorm → Dropout → Dense(128, relu) → Dropout → Dense(5, softmax)`.
-
-**What it does:**
-
-- The first **LSTM** reads the downsampled sequence **in order** and keeps a hidden state that summarizes “what has happened so far” at each step; `return_sequences=True` means it still outputs a vector per timestep for the next LSTM.
-- The second **LSTM** aggregates that into **one hidden vector for the entire window** (`return_sequences=False`). That vector is a **global summary** of the pattern after Stage 1’s local filtering.
-- The **Dense** layers form an MLP that maps that summary to **five logits**; **softmax** turns logits into **class probabilities** that sum to 1.
-
-**Intuition:** Stage 2 answers “given the temporal evolution after local filtering, which of the five classes is this window?” — including DoS when **timing/context** in the window differs from benign stretches.
-
-**Training signal:** Categorical cross-entropy between one-hot true labels and softmax predictions, with **class weights** so rare classes are not ignored.
+10. **Stage 2-only plot (interpretability)**  
+    - Subset: samples where **Stage 1 predicted Normal** *and* ground truth is **Normal** or **zero_day** (i.e. GAN).  
+    - Binary confusion: predicted **Normal** vs **zero_day** from the AE rule → `midsem_cm_stage2.png`.
 
 ---
 
-## 7. How this differs from **Stage 1 / Stage 2** in `IDS_new_pipeline.ipynb`
+## 3. What each stage is doing (conceptually)
 
-The **notebook** uses a **different** two-stage *system* (two separate models + a rule):
+### Stage 1
 
-| Notebook stage | Role |
-|------------------|------|
-| **Stage 1** | An **attack-type classifier** (LSTM + Dense) trained **only on attack rows**, among four attacks. Input was effectively `(batch, 1, n_features)` — almost **no sequence**. |
-| **Stage 2** | An **autoencoder** trained on **Normal** only; reconstruction error defines a threshold. |
-| **Inference rule** | Always run Stage 1, but if AE error ≤ threshold → output **Normal**, else output Stage 1’s attack class. |
+Learns discriminative patterns in **short multivariate time series** of CAN features to separate **Normal** from each **known** attack class. It is **not** responsible for novel attacks: anything it confidently calls non-Normal bypasses the AE.
 
-Because DoS often **reconstructs like Normal** under MSE on per-message vectors, Stage 2 **forced** Normal and **erased** DoS regardless of Stage 1.
+### Stage 2
 
-**This script:** no autoencoder gate; temporal **windows** + richer features + **joint 5-class training** fix that failure mode.
+Learns a **manifold of normal traffic** in flat window space. Windows that **look like Normal to Stage 1** but **do not reconstruct well** are treated as **out-of-distribution** → **`zero_day`**. The GAN provides **synthetic OOD** probes that should trigger high reconstruction error relative to real normals, so the threshold can be validated without a real zero-day dataset.
 
----
+### GAN
 
-## 8. Training configuration (knobs)
-
-- `SEQ_LEN`, `BATCH_SIZE`, `EPOCHS`, `PATIENCE`, `VAL_SPLIT` — see top of the `.py` file.
-- `USE_SUBSET`, `MAX_NORMAL`, `MAX_PER_ATTACK_FILE` — control dataset size for fast runs.
+The **generator** does not label data; it **creates challenging negatives** for the AE. If the GAN matches the normal manifold too well, MSE may stay low (harder `zero_day` detection); weaker GANs often yield **higher** AE error and are **easier** to flag.
 
 ---
 
-## 9. Evaluation outputs (metrics + chart)
+## 4. Output artefacts (same directory as the script)
 
-After `model.predict` on the held-out test windows, the script:
+| File | Content |
+|------|---------|
+| `midsem_cm_stage1.png` | Confusion matrix heatmap — Stage 1 only, 5 classes. |
+| `midsem_cm_stage2.png` | Heatmap — AE decision when Stage 1 says Normal; truth Normal vs `zero_day`. |
+| `midsem_cm_final_hybrid.png` | Heatmap — full hybrid, 6 classes. |
 
-1. Prints **accuracy**.
-2. Prints **precision, recall, F1** with **`macro`** and **`weighted`** averaging (sklearn definitions: macro = unweighted mean over classes; weighted = support-weighted mean).
-3. Prints **per-class** precision, recall, F1, and support.
-4. Prints the numeric **confusion matrix** (rows = true class, columns = predicted class).
-5. Prints sklearn’s **classification_report**.
-6. Saves **`midsem_model_improvised_confusion_matrix.png`**: a **seaborn heatmap** of the confusion matrix for quick visual inspection of which classes are confused with which.
+Each heatmap title includes **accuracy** and **macro precision / recall / F1**. The console prints the same plus **weighted** averages and sklearn **`classification_report`**.
 
 ---
 
-## 10. How to run
+## 5. Hyperparameters (top of `.py`)
 
-- **Colab:** mount Drive, set `data_path`, run the script.
-- **Local:** place the Car-Hacking folder where `data_path` points, install `tensorflow`, `scikit-learn`, `pandas`, `numpy`, `matplotlib`, `seaborn`, then `python midsem_model_improvised.py`.
+Key knobs: `SEQ_LEN`, `STAGE1_EPOCHS`, `AE_EPOCHS`, `GAN_EPOCHS`, `GAN_STEPS_PER_EPOCH`, `NUM_GAN_TEST_WINDOWS`, `STAGE2_NORMAL_PERCENTILE`, `GAN_NOISE_DIM`, batch sizes.
 
-If the dataset path is wrong, the script prints an error and exits before training.
+---
+
+## 6. How to run
+
+Set `data_path` to the Car-Hacking folder, install TensorFlow + sklearn + pandas + numpy + matplotlib + seaborn, then:
+
+`python midsem_model_improvised.py`
+
+If the dataset path is missing, the script exits with an error before training.
