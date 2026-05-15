@@ -641,3 +641,210 @@ Raw files (txt + CSV)
 5. **Stratified splits** preserve class balance; **AE sees only Normal** — core of zero-day detection design.
 
 6. **zero_day** is not in the raw dataset — it is evaluated using **synthetic GAN windows** at test time.
+
+---
+
+## Q8. Give a summary of the base paper (`2603.25763v1.pdf`)
+
+**Paper:** *CANGuard: A Spatio-Temporal CNN-GRU-Attention Hybrid Architecture for Intrusion Detection in In-Vehicle CAN Networks*  
+**Source:** arXiv:2603.25763v1 (2026)
+
+### 1) Problem the paper addresses
+
+Modern connected vehicles rely on the CAN bus, which does not provide built-in authentication/encryption. This makes CAN messages vulnerable to injection and spoofing attacks. The paper targets **intrusion detection** for this setting.
+
+### 2) Core idea (model contribution)
+
+CANGuard proposes a **single-stage supervised deep architecture**:
+
+- **1D CNN** blocks for local/spatial feature extraction from CAN windows
+- **Stacked bidirectional GRU** layers for temporal dependency learning
+- **Attention mechanism** to focus on important time steps/features
+- **Fully connected + softmax** for final multi-class prediction
+
+In short: CNN captures local patterns, BiGRU captures sequence context, attention improves focus before classification.
+
+### 3) Dataset and setup
+
+- Evaluated on **CICIoV2024** (IoV CAN intrusion benchmark)
+- Uses sliding windows and standard preprocessing
+- Addresses class imbalance (paper summary mentions BorderlineSMOTE + class weighting)
+- Trained with Adam, cross-entropy, early stopping, regularization
+
+### 4) Main results (high-level)
+
+- Strong classification metrics (accuracy / precision / recall / F1) on known attack classes
+- Ablation study shows benefit of combining CNN + GRU + attention over simpler variants
+- SHAP-based analysis gives feature-importance interpretation for payload bytes
+
+### 5) Paper limitations (important for viva)
+
+The paper itself is mainly a **closed-set** supervised IDS study:
+
+- Evaluated offline on one benchmark
+- No on-vehicle real-time deployment study
+- No explicit adversarial-robustness study
+- No dedicated open-set/unknown (`zero_day`) detection module
+
+### 6) Why it is the base for our work
+
+CANGuard gives a strong Stage-1 philosophy: supervised spatio-temporal modeling for known attacks.  
+Our `claude_opus_model.py` keeps that spirit for known classes and extends it with a Stage-2 anomaly detector to handle unknown/zero-day behavior that closed-set models miss.
+
+### 7) 20-second presentation version
+
+> CANGuard is a supervised CNN-BiGRU-Attention CAN IDS for known attacks on CICIoV2024.  
+> It performs strongly in closed-set classification but does not explicitly solve zero-day detection.  
+> Our work builds on that idea and adds a second unsupervised stage to detect unknown attacks among traffic Stage 1 considers normal.
+
+---
+
+## Q9. How can we say our model is based on this base paper? (Explain how)
+
+This is a common viva question: *“You say CANGuard is your base paper — in what sense is your work actually based on it?”*  
+Below is an honest, defensible way to explain it.
+
+---
+
+### Short answer (use this first)
+
+> **Our work is based on CANGuard in problem formulation and Stage-1 design philosophy — spatio-temporal deep learning for CAN intrusion detection — and we extend it with a second stage for zero-day detection, which the paper identifies as future work but does not implement.**
+
+We are **not** claiming we copied CANGuard’s exact architecture, dataset, or results. We are claiming we **inherit its core supervised IDS idea** and **extend** it for open-set / unknown attacks.
+
+---
+
+### What “based on” means in research (three levels)
+
+| Level | Meaning | Does our work qualify? |
+|-------|---------|------------------------|
+| **1. Problem & domain** | Same application: CAN bus IDS for connected vehicles | **Yes** — same threat model (DoS, spoofing, malicious frames on CAN) |
+| **2. Methodology** | Same high-level approach: deep learning on windowed CAN features with spatial + temporal modeling | **Yes for Stage 1** — CNN + recurrent temporal model on sliding windows |
+| **3. Exact replication** | Same model layers, same dataset, same hyperparameters, same paper results | **No** — different dataset (Car-Hacking), different Stage-1 details (LSTM not BiGRU+Attention), plus entire Stage 2 |
+
+**Correct phrasing:** *“Inspired by and extended from CANGuard”* or *“Built on the CANGuard paradigm with a novel second stage”* — not *“We implemented CANGuard as-is.”*
+
+---
+
+### Line-by-line: how our pipeline maps to CANGuard
+
+```text
+CANGuard (paper)                    Our claude_opus_model.py
+─────────────────────────────────────────────────────────────────
+CAN intrusion detection      →      Same goal
+Sliding windows on CAN data  →      SEQ_LEN = 24 windows
+Multi-class known attacks    →      Stage 1: Normal, DoS, Fuzzy, Gear, RPM
+CNN for local patterns       →      Stage 1: Conv1D(64) → Conv1D(128)
+Temporal model (BiGRU)       →      Stage 1: LSTM(96) → LSTM(64)  [same role]
+Attention + FC + softmax     →      Stage 1: Dense + softmax (no attention block)
+Class imbalance handling     →      Balanced class weights (different technique)
+Closed-set only              →      Stage 2 added: zero_day on Normal-looking traffic
+Future work: AE on normals   →      Implemented: AE ensemble + Mahalanobis + GAN probes
+```
+
+**Stage 1 is the direct conceptual descendant of CANGuard.**  
+**Stage 2 is our contribution** — explicitly aligned with the paper’s stated future direction (unsupervised screening on benign-looking traffic).
+
+---
+
+### Four concrete reasons we can call it “based on” CANGuard
+
+#### 1) Same problem statement
+
+Both systems answer: *“Is this CAN traffic benign or malicious?”*  
+CANGuard answers it with **one supervised classifier** over a fixed set of classes.  
+We answer it with **supervised known attacks (Stage 1) + unsupervised unknown detection (Stage 2)** — but the **domain, inputs (CAN frames), and windowing idea** come from the same IDS line of work that CANGuard represents.
+
+#### 2) Same spatio-temporal modeling philosophy
+
+CANGuard’s main insight: CAN attacks are not visible in a single frame — you need **spatial** (per-frame / local) and **temporal** (across frames) modeling.
+
+Our Stage 1 follows that blueprint:
+
+- **Spatial / local:** Conv1D layers extract patterns across features and short time steps (like CANGuard’s CNN).
+- **Temporal:** LSTM layers model how the window evolves over 24 frames (same *role* as CANGuard’s BiGRU, different cell type).
+
+For presentation: *“Stage 1 implements the CANGuard-style spatio-temporal backbone for known attack classification.”*
+
+#### 3) Same preprocessing paradigm
+
+Both pipelines:
+
+1. Parse CAN logs into structured rows (ID, DLC, payload bytes, timestamp).
+2. Build **sliding windows** with a label tied to the window.
+3. Scale features for neural network training.
+4. Handle **class imbalance** during supervised training.
+
+We use MinMax + class weights instead of Z-score + SMOTE, but the **pipeline structure** is the same class of solution CANGuard uses.
+
+#### 4) We implement what CANGuard calls “future work”
+
+From `CANGuard_base_paper_summary.md` (and the paper’s limitations / future work):
+
+> Pairing this supervised architecture with a **second stage trained only on normal traffic** (e.g. autoencoder) is a natural way to address **open-set or unknown** attack behavior.
+
+That sentence is essentially our **Stage 2 design document**. Our work is “based on” CANGuard in the sense that:
+
+- We **accept** its supervised Stage-1 role for known attacks.
+- We **extend** it where the paper stops — zero-day / unknown detection.
+
+---
+
+### How to say it in a presentation (ready-made sentences)
+
+**Slide 1 — Base paper:**
+> “We take **CANGuard** (CNN–BiGRU–Attention) as our reference architecture for **known-attack detection** on in-vehicle CAN traffic.”
+
+**Slide 2 — Our extension:**
+> “CANGuard is **closed-set**: it cannot label attacks outside its training classes. We add **Stage 2**: an autoencoder ensemble trained only on Normal traffic, with Mahalanobis-based scoring, to flag **zero-day** windows that Stage 1 still calls Normal.”
+
+**Slide 3 — Relationship (one line):**
+> “**Stage 1 = CANGuard paradigm; Stage 2 = our contribution beyond the paper.**”
+
+**If examiner asks “Did you implement CANGuard?”**
+> “We implemented the **same architectural idea** (CNN + temporal network on windowed CAN features) for Stage 1, adapted to the Car-Hacking dataset and TensorFlow. We did **not** replicate every layer (no attention block, LSTM instead of BiGRU). Our **novel part** is the hybrid second stage, which the base paper suggests but does not build.”
+
+---
+
+### What we should NOT claim (stay honest)
+
+| Do not say | Say instead |
+|------------|-------------|
+| “We implemented CANGuard.” | “We adapted the CANGuard **spatio-temporal supervised IDS approach** for Stage 1.” |
+| “We improved CANGuard’s accuracy on CICIoV2024.” | “We evaluated on **Car-Hacking** with a **two-stage** system; direct accuracy comparison to the paper is not apples-to-apples.” |
+| “Our Stage 1 is identical to CANGuard.” | “Stage 1 is **inspired by** CANGuard: CNN + temporal model, but LSTM backbone and no attention.” |
+| “CANGuard detects zero-day.” | “CANGuard does **not**; we add zero-day via Stage 2.” |
+
+---
+
+### Visual for slides: “Based on” = inherit + extend
+
+```text
+                    CANGuard (base paper)
+                    ┌─────────────────────┐
+                    │  CNN + BiGRU + Attn │
+                    │  → softmax (6 cls)  │
+                    │  closed-set only    │
+                    └──────────┬──────────┘
+                               │ inherit idea
+                               ▼
+                    Our Stage 1 (adapted)
+                    ┌─────────────────────┐
+                    │  CNN + LSTM         │
+                    │  → softmax (5 cls)  │
+                    └──────────┬──────────┘
+                               │ extend (paper's future work)
+                               ▼
+                    Our Stage 2 (new)
+                    ┌─────────────────────┐
+                    │  AE ensemble ×3     │
+                    │  Mahalanobis score  │
+                    │  → zero_day if > T  │
+                    └─────────────────────┘
+```
+
+---
+
+### One-paragraph viva answer (memorize this)
+
+> Our model is based on CANGuard because we adopt the same fundamental approach to CAN intrusion detection: we convert CAN traffic into sliding windows, extract spatio-temporal features with a convolutional front end and a recurrent temporal model, and use a supervised classifier for known attack types. CANGuard stops at closed-set classification and notes that unknown attacks require additional mechanisms. We directly address that gap by adding Stage 2 — an unsupervised autoencoder ensemble with Mahalanobis anomaly scoring — on traffic that Stage 1 labels as Normal. So CANGuard is the foundation for known-attack detection; our contribution is the hybrid extension for zero-day detection, which aligns with the base paper’s own suggested future direction.
