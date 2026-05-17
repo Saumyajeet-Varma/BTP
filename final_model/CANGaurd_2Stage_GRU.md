@@ -72,6 +72,7 @@ Raw CAN stream
 ### Stage 1 Model — CNN + BiGRU + Multi-Head Attention
 
 **Architecture:**
+
 ```
 Input (24, 14)
   → Conv1D(64) → BatchNorm → MaxPool → Dropout
@@ -104,6 +105,7 @@ The dataset is imbalanced — normal traffic appears far more often than any sin
 An autoencoder is trained to **compress and reconstruct** its training data. If you train it only on normal traffic, it learns the structure of normal CAN patterns. When it sees an anomalous window, it fails to reconstruct it well — that high reconstruction error is the anomaly signal.
 
 **Architecture of each AE:**
+
 ```
 Encoder:
   Input (24, 14)
@@ -142,6 +144,7 @@ The LSTM variant used `Bidirectional(LSTM(64, return_sequences=False))`, which c
 A single AE has a noisy anomaly score — it depends on random initialization and the specific SGD trajectory. Two normal windows can get very different scores simply due to AE training variance. By training 3 independent AEs with different seeds and averaging their scores, we reduce this variance by ≈ √3. A lower-variance Normal score distribution means we can set a higher, tighter threshold — and that is the direct lever for improving zero-day precision.
 
 **Attention hyper-parameters (shared Stage 1 / AE):**
+
 - `ATTN_NUM_HEADS = 4`
 - `ATTN_KEY_DIM = 32`
 - `ATTN_DROPOUT = 0.1`
@@ -229,28 +232,34 @@ Step 6 — Evaluation on X_test + GAN test windows
 
 ### Key principle: no data leakage
 
-| Data split | Used for |
-|------------|----------|
-| `X_fit` | Train Stage 1 + Train AE ensemble + Train GAN |
-| `X_val` | Tune threshold T only (AE weights never updated on this) |
-| `X_test` | Final evaluation only — never touched during training or tuning |
+
+| Data split | Used for                                                        |
+| ---------- | --------------------------------------------------------------- |
+| `X_fit`    | Train Stage 1 + Train AE ensemble + Train GAN                   |
+| `X_val`    | Tune threshold T only (AE weights never updated on this)        |
+| `X_test`   | Final evaluation only — never touched during training or tuning |
+
 
 ---
 
 ## Q4. What is a zero_day attack here?
 
 ### Real-world definition
+
 A **zero-day attack** is an attack that exploits a vulnerability or uses a technique that was **unknown at the time the defense was built**. The defender has had zero days to prepare for it.
 
 ### What it means in this pipeline
+
 In this system, **zero_day is the label for any CAN bus attack pattern the Stage-1 classifier was never trained on.**
 
 Stage 1 is trained on four specific labeled attack families: DoS, Fuzzy, Gear spoofing, RPM spoofing. Any attack that is structurally different from these — a novel payload injection, a timing-based side-channel, a new spoofing variant — would look like Normal traffic to Stage 1 and pass through undetected.
 
 ### How zero_day traffic is simulated in this work
+
 Since real unknown attacks are, by definition, unavailable during development, we use a **GAN (Generative Adversarial Network)** trained on real normal traffic to synthesize **plausible-but-novel** windows as proxies for zero-day traffic.
 
 The GAN generator learns the statistical distribution of normal CAN traffic and produces new samples that:
+
 - Are statistically similar to normals (so Stage 1 cannot distinguish them)
 - Are not identical to any real normal window (they are off the true normal manifold)
 - Represent the regime where a stealthy unknown attack would live
@@ -258,9 +267,11 @@ The GAN generator learns the statistical distribution of normal CAN traffic and 
 These GAN-generated windows are labelled `zero_day` for evaluation. At test time, 1500 fresh GAN windows are mixed into the test set and the system is evaluated on its ability to flag them.
 
 ### Why this is a meaningful stand-in
+
 A stealthy attacker would craft traffic that looks normal to known classifiers but deviates subtly from genuine normal traffic. That is exactly what the GAN produces — it is trained to fool a discriminator that has seen real normals. The Stage-2 anomaly detector must find the deviation in the reconstruction residual or the latent space geometry, not in the label space.
 
 ### What Stage 2 does with it
+
 Stage 2 never sees the zero-day label during training. It is trained purely on normals. At inference, it scores every Stage-1-Normal window and flags it as `zero_day` if the anomaly score exceeds threshold `T`. The quality of this detection is measured by precision and recall on the `zero_day` class.
 
 **Design target:** zero_day precision ≥ 0.85 (using the precision-floor constraint in threshold tuning on validation).
@@ -298,6 +309,7 @@ d_M(z) = sqrt( (z - μ)ᵀ · Σ⁻¹ · (z - μ) )
 ```
 
 Where:
+
 - `z` is the latent vector (32-D in this model)
 - `μ` is the mean latent vector of all train-Normal windows
 - `Σ⁻¹` is the inverse of the covariance matrix of train-Normal latents
@@ -308,13 +320,15 @@ Where:
 
 ### Why Mahalanobis over z-score on ‖z‖?
 
-| Property | z-score on ‖z‖ | Mahalanobis on z |
-|----------|----------------|------------------|
-| Dimensions used | 1 (the norm) | All 32 |
-| Captures correlations between latent dims | No | Yes |
-| Scale-invariant per dimension | No | Yes |
-| Catches directional anomalies | No | Yes |
-| Catches magnitude anomalies | Yes | Yes |
+
+| Property                                  | z-score on ‖z‖ | Mahalanobis on z |
+| ----------------------------------------- | -------------- | ---------------- |
+| Dimensions used                           | 1 (the norm)   | All 32           |
+| Captures correlations between latent dims | No             | Yes              |
+| Scale-invariant per dimension             | No             | Yes              |
+| Catches directional anomalies             | No             | Yes              |
+| Catches magnitude anomalies               | Yes            | Yes              |
+
 
 **Concrete example:** Suppose a zero-day attack shifts latent dimensions 3 and 7 in opposite directions. The L2 norm stays roughly the same (the shifts cancel). The z-score on `‖z‖` sees nothing. Mahalanobis sees the point is off the normal ellipsoid in the (dim3, dim7) plane and correctly gives it a high distance.
 
@@ -329,13 +343,12 @@ Inverting a 32×32 covariance matrix estimated from ~6,000–10,000 samples can 
 Two safeguards are applied:
 
 1. **Ledoit-Wolf style shrinkage (λ = 0.05):**
-   ```
+  ```
    Σ_shrunk = (1 - λ) · Σ  +  λ · diag(Σ)
-   ```
+  ```
    This blends the empirical covariance with a purely diagonal version. It moves extreme off-diagonal covariances slightly toward zero — reducing the effect of estimation noise in low-sample-count directions.
-
 2. **Eigenvalue floor (ε = 1e-4):**
-   After eigen-decomposition, any eigenvalue below `1e-4` is clipped to `1e-4` before inverting. This prevents any latent direction from blowing up the precision matrix due to near-zero variance.
+  After eigen-decomposition, any eigenvalue below `1e-4` is clipped to `1e-4` before inverting. This prevents any latent direction from blowing up the precision matrix due to near-zero variance.
 
 Together these make the Mahalanobis computation **numerically stable** across different AE seeds and dataset samples without distorting the dominant structure of the normal latent distribution.
 
@@ -358,89 +371,87 @@ Together these make the Mahalanobis computation **numerically stable** across di
 
 ### Side-by-side comparison
 
-| Aspect | CANGuard (base paper) | Our `CANGaurd_2Stage_GRU.py` |
-|--------|----------------------|------------------------------|
-| **Overall design** | Single-stage, end-to-end classifier | **Two-stage hybrid** (supervised + unsupervised) |
-| **Problem scope** | **Closed-set** — only classes seen at training time | **Open-set** — adds a 6th label: **zero_day** |
-| **Stage 1 backbone** | CNN → stacked **BiGRU** → **attention** → FC → softmax | CNN → **BiGRU** → **Multi-Head Attention** → BiGRU → FC → softmax |
-| **Stage 2** | **None** | Ensemble of **3 sequence-aware autoencoders** (BiGRU + attention) + Mahalanobis + multi-score fusion |
-| **Unknown attacks** | Not detected (must be one of 6 trained classes) | Flagged as **zero_day** when anomaly score > threshold |
-| **Dataset** | **CICIoV2024** (~1.4M samples, 12 features) | **Car-Hacking Dataset** (DoS, Fuzzy, Gear, RPM + Normal) |
-| **Classes** | BENIGN, DoS, GAS, RPM, SPEED, STEERING WHEEL | Normal, DoS, Fuzzy, Gear, RPM, **zero_day** |
-| **Normalization** | **Z-score** per feature | **MinMaxScaler** to [0, 1] |
-| **Imbalance handling** | **BorderlineSMOTE** on flattened training windows | **Class weights** in Stage-1 loss (no SMOTE) |
-| **Stage-2 training data** | N/A | **Normal traffic only** (AE never sees attacks) |
-| **Zero-day evaluation** | Not in paper | **GAN + noise + feature-shuffle** probes; threshold tuned on validation |
-| **Anomaly scoring** | N/A | Mean MSE + max-step MSE + **Mahalanobis** in latent; robust median/MAD; **ensemble average** |
-| **Threshold / operating point** | Argmax softmax | Grid search on validation; **F0.5** (precision-priority) + precision floor ≥ 0.85 |
-| **Interpretability** | **SHAP** on payload bytes | Confusion matrices (Stage 1, Stage 2, hybrid) — no SHAP in this script |
-| **Framework** | Not specified in summary (typical PyTorch/TF in such papers) | **TensorFlow / Keras** |
+
+| Aspect                          | CANGuard (base paper)                                        | Our `CANGaurd_2Stage_GRU.py`                                                                         |
+| ------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| **Overall design**              | Single-stage, end-to-end classifier                          | **Two-stage hybrid** (supervised + unsupervised)                                                     |
+| **Problem scope**               | **Closed-set** — only classes seen at training time          | **Open-set** — adds a 6th label: **zero_day**                                                        |
+| **Stage 1 backbone**            | CNN → stacked **BiGRU** → **attention** → FC → softmax       | CNN → **BiGRU** → **Multi-Head Attention** → BiGRU → FC → softmax                                    |
+| **Stage 2**                     | **None**                                                     | Ensemble of **3 sequence-aware autoencoders** (BiGRU + attention) + Mahalanobis + multi-score fusion |
+| **Unknown attacks**             | Not detected (must be one of 6 trained classes)              | Flagged as **zero_day** when anomaly score > threshold                                               |
+| **Dataset**                     | **CICIoV2024** (~1.4M samples, 12 features)                  | **Car-Hacking Dataset** (DoS, Fuzzy, Gear, RPM + Normal)                                             |
+| **Classes**                     | BENIGN, DoS, GAS, RPM, SPEED, STEERING WHEEL                 | Normal, DoS, Fuzzy, Gear, RPM, **zero_day**                                                          |
+| **Normalization**               | **Z-score** per feature                                      | **MinMaxScaler** to [0, 1]                                                                           |
+| **Imbalance handling**          | **BorderlineSMOTE** on flattened training windows            | **Class weights** in Stage-1 loss (no SMOTE)                                                         |
+| **Stage-2 training data**       | N/A                                                          | **Normal traffic only** (AE never sees attacks)                                                      |
+| **Zero-day evaluation**         | Not in paper                                                 | **GAN + noise + feature-shuffle** probes; threshold tuned on validation                              |
+| **Anomaly scoring**             | N/A                                                          | Mean MSE + max-step MSE + **Mahalanobis** in latent; robust median/MAD; **ensemble average**         |
+| **Threshold / operating point** | Argmax softmax                                               | Grid search on validation; **F0.5** (precision-priority) + precision floor ≥ 0.85                    |
+| **Interpretability**            | **SHAP** on payload bytes                                    | Confusion matrices (Stage 1, Stage 2, hybrid) — no SHAP in this script                               |
+| **Framework**                   | Not specified in summary (typical PyTorch/TF in such papers) | **TensorFlow / Keras**                                                                               |
+
 
 ---
 
 ### What we kept (closest alignment to CANGuard among our scripts)
 
 1. **Spatio-temporal idea for known attacks** — Stage 1 uses **1D convolutions** for local frame patterns, **bidirectional GRU** for sequence context, and a **multi-head self-attention** block — the same high-level stack as the paper.
-
 2. **Sliding windows** — Both pipelines segment the CAN stream into fixed-length windows and label by the window (label at end of window in CANGuard; same idea in our script).
-
 3. **Multi-class supervised IDS on CAN** — Stage 1 is the direct analogue of CANGuard’s role: classify **known** attack types vs Normal.
-
 4. **Class imbalance awareness** — CANGuard uses SMOTE + class weights; we use **balanced class weights** on Stage 1 (different technique, same goal).
 
 ---
 
 ### What we added (our contribution beyond the paper)
 
-1. **Second stage for open-set / zero-day detection**  
-   CANGuard’s own limitations section states: no handling of attacks outside the training label set. We implement exactly what their “future work” suggests: a model trained **only on Normal** that screens windows Stage 1 still calls Normal.
-
-2. **Hybrid decision rule**  
-   ```
+1. **Second stage for open-set / zero-day detection**
+  CANGuard’s own limitations section states: no handling of attacks outside the training label set. We implement exactly what their “future work” suggests: a model trained **only on Normal** that screens windows Stage 1 still calls Normal.
+2. **Hybrid decision rule**
+  ```
    If Stage 1 ≠ Normal  →  known attack label
    If Stage 1 = Normal and score > T  →  zero_day
    If Stage 1 = Normal and score ≤ T  →  Normal
-   ```
+  ```
    CANGuard has no such branch — every sample gets a single softmax class.
-
-3. **Sequence-aware autoencoder ensemble (Stage 2)**  
-   - Conv1D + BiGRU + attention bottleneck AE on `(24, 14)` windows (not a flat MLP).  
-   - **3 AEs** with different seeds; scores averaged for stability.  
-   - **Mahalanobis distance** in 32-D latent space (with covariance shrinkage), not just reconstruction error.
-
-4. **Multi-signal anomaly score**  
-   Three complementary signals fused with robust standardization (median/MAD) and averaged: global reconstruction error, **max per-timestep** reconstruction error (localized spoof), and latent Mahalanobis distance.
-
-5. **GAN + diverse OOD probes for calibration**  
-   CANGuard does not use generative models. We train a GAN on normal flats to synthesize plausible unknowns, plus uniform-noise and feature-shuffled normals, to tune the Stage-2 threshold without real zero-day labels.
-
-6. **Precision-prioritized threshold (F0.5 + precision floor)**  
-   Tuned on a held-out validation set that Stage 2 never trained on — targets high **zero_day precision** under Normal-heavy traffic at test time.
+3. **Sequence-aware autoencoder ensemble (Stage 2)**
+  - Conv1D + BiGRU + attention bottleneck AE on `(24, 14)` windows (not a flat MLP).  
+  - **3 AEs** with different seeds; scores averaged for stability.  
+  - **Mahalanobis distance** in 32-D latent space (with covariance shrinkage), not just reconstruction error.
+4. **Multi-signal anomaly score**
+  Three complementary signals fused with robust standardization (median/MAD) and averaged: global reconstruction error, **max per-timestep** reconstruction error (localized spoof), and latent Mahalanobis distance.
+5. **GAN + diverse OOD probes for calibration**
+  CANGuard does not use generative models. We train a GAN on normal flats to synthesize plausible unknowns, plus uniform-noise and feature-shuffled normals, to tune the Stage-2 threshold without real zero-day labels.
+6. **Precision-prioritized threshold (F0.5 + precision floor)**
+  Tuned on a held-out validation set that Stage 2 never trained on — targets high **zero_day precision** under Normal-heavy traffic at test time.
 
 ---
 
 ### What we simplified or changed vs CANGuard
 
-| CANGuard feature | Our choice | Why |
-|------------------|------------|-----|
-| **Stacked BiGRU** (multiple layers in paper) | Two BiGRU blocks in Stage 1 (96 then 64 units) | Simpler depth on Car-Hacking subset; attention between stacks |
-| **Attention type** | Keras `MultiHeadAttention` (4 heads) + residual + LayerNorm | Standard transformer-style block; self-attention on sequence |
-| **SHAP interpretability** | Not in this file | Focus of script is hybrid + zero-day metrics, not byte-level explanation |
-| **BorderlineSMOTE** | Not used | Avoids synthetic **labeled** attack windows that could blur Stage-1 boundaries; Stage 2 uses separate **unlabeled** synthetic probes instead |
-| **Z-score normalization** | **MinMax** to [0, 1] | Matches AE/GAN sigmoid outputs and flat probe space |
+
+| CANGuard feature                             | Our choice                                                  | Why                                                                                                                                          |
+| -------------------------------------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Stacked BiGRU** (multiple layers in paper) | Two BiGRU blocks in Stage 1 (96 then 64 units)              | Simpler depth on Car-Hacking subset; attention between stacks                                                                                |
+| **Attention type**                           | Keras `MultiHeadAttention` (4 heads) + residual + LayerNorm | Standard transformer-style block; self-attention on sequence                                                                                 |
+| **SHAP interpretability**                    | Not in this file                                            | Focus of script is hybrid + zero-day metrics, not byte-level explanation                                                                     |
+| **BorderlineSMOTE**                          | Not used                                                    | Avoids synthetic **labeled** attack windows that could blur Stage-1 boundaries; Stage 2 uses separate **unlabeled** synthetic probes instead |
+| **Z-score normalization**                    | **MinMax** to [0, 1]                                        | Matches AE/GAN sigmoid outputs and flat probe space                                                                                          |
+
 
 ---
 
 ### Comparison: `CANGaurd_2Stage_GRU.py` vs `CANGuard_2Stage_LSTM.py` (our two scripts)
 
-| Aspect | LSTM variant | GRU variant (this file) |
-|--------|--------------|-------------------------|
-| **Stage 1 temporal model** | LSTM(96) → LSTM(64) | BiGRU(96) → **Attention** → BiGRU(64) |
-| **Stage 2 AE encoder** | BiLSTM(64) → Dense(latent) | BiGRU(64) → **Attention** → GAP → Dense(latent) |
-| **Stage 2 AE decoder** | LSTM(64) | BiGRU(64) → **Attention** |
-| **Alignment with CANGuard paper** | Partial (CNN + RNN, no attention) | **Closer** (CNN + BiGRU + attention) |
-| **Pipeline / scoring / GAN / threshold** | Identical | Identical |
-| **Output plots** | `claude_opus_cm_*.png` | `cangaurd_gru_cm_*.png` |
+
+| Aspect                                   | LSTM variant                      | GRU variant (this file)                         |
+| ---------------------------------------- | --------------------------------- | ----------------------------------------------- |
+| **Stage 1 temporal model**               | LSTM(96) → LSTM(64)               | BiGRU(96) → **Attention** → BiGRU(64)           |
+| **Stage 2 AE encoder**                   | BiLSTM(64) → Dense(latent)        | BiGRU(64) → **Attention** → GAP → Dense(latent) |
+| **Stage 2 AE decoder**                   | LSTM(64)                          | BiGRU(64) → **Attention**                       |
+| **Alignment with CANGuard paper**        | Partial (CNN + RNN, no attention) | **Closer** (CNN + BiGRU + attention)            |
+| **Pipeline / scoring / GAN / threshold** | Identical                         | Identical                                       |
+| **Output plots**                         | `claude_opus_cm_*.png`            | `cangaurd_gru_cm_*.png`                         |
+
 
 Use the GRU script when you want Stage 1 and Stage 2 backbones to mirror the **CANGuard paper architecture** more closely; use the LSTM script as an ablation / lighter recurrent baseline.
 
@@ -449,7 +460,7 @@ Use the GRU script when you want Stage 1 and Stage 2 backbones to mirror the **C
 ### Dataset difference (important for viva)
 
 - **CANGuard** is evaluated on **CICIoV2024** (IoV benchmark, different attack names and scale).  
-- **We** use the **Car-Hacking Dataset** (academic CAN intrusion benchmark with DoS, Fuzzy, Gear, RPM).  
+- **We** use the **Car-Hacking Dataset** (academic CAN intrusion benchmark with DoS, Fuzzy, Gear, RPM).
 
 So we are **not replicating CANGuard’s exact experiment** — we are **adapting its CNN–BiGRU–Attention supervised IDS idea** to a different dataset and **extending the architecture** with Stage 2. Fair comparison sentence: *“Stage 1 follows the spatio-temporal supervised IDS paradigm of CANGuard; Stage 2 and zero_day handling are our extensions.”*
 
@@ -478,15 +489,18 @@ So we are **not replicating CANGuard’s exact experiment** — we are **adaptin
 
 **Files used in the script:**
 
-| File | Format | Role |
-|------|--------|------|
-| `normal_run_data.txt` | Text log (regex-parsed) | Benign CAN traffic only |
-| `DoS_dataset.csv` (or `dos_attack.csv`) | CSV | DoS attack + mixed R/T flags |
-| `Fuzzy_dataset.csv` (or `fuzzy_attack.csv`) | CSV | Fuzzy attack |
-| `gear_dataset.csv` (or `gear_spoofing.csv`) | CSV | Gear spoofing |
-| `RPM_dataset.csv` (or `rpm_spoofing.csv`) | CSV | RPM spoofing |
+
+| File                                        | Format                  | Role                         |
+| ------------------------------------------- | ----------------------- | ---------------------------- |
+| `normal_run_data.txt`                       | Text log (regex-parsed) | Benign CAN traffic only      |
+| `DoS_dataset.csv` (or `dos_attack.csv`)     | CSV                     | DoS attack + mixed R/T flags |
+| `Fuzzy_dataset.csv` (or `fuzzy_attack.csv`) | CSV                     | Fuzzy attack                 |
+| `gear_dataset.csv` (or `gear_spoofing.csv`) | CSV                     | Gear spoofing                |
+| `RPM_dataset.csv` (or `rpm_spoofing.csv`)   | CSV                     | RPM spoofing                 |
+
 
 **Subset mode (default):** For faster experiments, `USE_SUBSET = True` caps:
+
 - **10,000** normal frames from the text log
 - **20,000** rows per attack CSV
 
@@ -494,11 +508,13 @@ Set `USE_SUBSET = False` to use the full dataset.
 
 **Classes after preprocessing:**
 
-| Label | Source |
-|-------|--------|
-| Normal | Normal log, or attack CSV rows with Flag = **R** (recovery / benign segment) |
-| DoS, Fuzzy, Gear, RPM | Attack CSV rows with Flag = **T** (attack segment) |
-| zero_day | **Not in raw data** — synthetic GAN windows at test/eval time only |
+
+| Label                 | Source                                                                       |
+| --------------------- | ---------------------------------------------------------------------------- |
+| Normal                | Normal log, or attack CSV rows with Flag = **R** (recovery / benign segment) |
+| DoS, Fuzzy, Gear, RPM | Attack CSV rows with Flag = **T** (attack segment)                           |
+| zero_day              | **Not in raw data** — synthetic GAN windows at test/eval time only           |
+
 
 Stage 1 is trained on **5 classes** (no zero_day in training labels). zero_day appears only in evaluation.
 
@@ -508,14 +524,17 @@ Stage 1 is trained on **5 classes** (no zero_day in training labels). zero_day a
 
 Every frame (one row before windowing) has:
 
-| Field | Meaning |
-|-------|---------|
-| **Timestamp** | Time of the frame (seconds) |
-| **CAN_ID** | Identifier of the sending ECU / message type (hex in raw files) |
-| **DLC** | Data Length Code — how many payload bytes are valid (0–8) |
-| **DATA0 … DATA7** | Up to 8 payload bytes (hex values 0–255) |
+
+| Field             | Meaning                                                         |
+| ----------------- | --------------------------------------------------------------- |
+| **Timestamp**     | Time of the frame (seconds)                                     |
+| **CAN_ID**        | Identifier of the sending ECU / message type (hex in raw files) |
+| **DLC**           | Data Length Code — how many payload bytes are valid (0–8)       |
+| **DATA0 … DATA7** | Up to 8 payload bytes (hex values 0–255)                        |
+
 
 **Example (normal text line):**
+
 ```
 Timestamp: 1479121434.850202  ID: 0350  000  DLC: 8  05 28 84 66 6d 00 00 a2
 ```
@@ -529,18 +548,18 @@ The script parses this with a regex into structured fields.
 #### A) Normal traffic — `load_normal_df`
 
 1. Opens `normal_run_data.txt` (checks root or `normal_run_data/` subfolder).
-2. Reads line by line; **`parse_line`** extracts Timestamp, CAN_ID (hex → int), DLC, and 8 data bytes.
+2. Reads line by line; `**parse_line**` extracts Timestamp, CAN_ID (hex → int), DLC, and 8 data bytes.
 3. Pads data to 8 bytes if shorter; splits into `DATA0` … `DATA7`.
-4. Sets **`Label = "Normal"`** for every row.
+4. Sets `**Label = "Normal"**` for every row.
 
 #### B) Attack traffic — `load_attack_df`
 
 1. Reads CSV with columns: `Timestamp, CAN_ID, DLC, DATA0–DATA7, Flag`.
-2. **`convert_numeric_columns`:** CAN_ID and DATA bytes may be hex strings → converted to integers; invalid values → 0.
-3. **`label_from_flag`:**
-   - Flag **`R`** → **Normal** (benign segment inside an attack recording)
-   - Flag **`T`** → **attack label** (DoS / Fuzzy / Gear / RPM)
-   - Anything else → Normal (safe default)
+2. `**convert_numeric_columns`:** CAN_ID and DATA bytes may be hex strings → converted to integers; invalid values → 0.
+3. `**label_from_flag`:**
+  - Flag `**R`** → **Normal** (benign segment inside an attack recording)
+  - Flag `**T`** → **attack label** (DoS / Fuzzy / Gear / RPM)
+  - Anything else → Normal (safe default)
 
 **Why Flag matters:** Attack files contain *both* attack and recovery/normal periods. Using Flag avoids labelling entire files as attack when half the rows are benign.
 
@@ -560,14 +579,16 @@ These are the raw CAN semantics the model sees directly.
 
 #### Engineered features (6) — why each exists
 
-| Feature | Formula / idea | Why it helps IDS |
-|---------|----------------|------------------|
-| **IAT** (Inter-Arrival Time) | `diff(Timestamp)`, first row = 0, clipped to [0, 1] | DoS floods the bus → **very small IAT**; spoofing may change timing patterns |
-| **CAN_ID_freq** | Global frequency of each CAN_ID in that file (normalized count) | Rare IDs during an attack stand out; common IDs during normal driving get high freq |
-| **byte_entropy** | Shannon entropy of non-zero DATA bytes in the row | Random/fuzzy payloads → **high entropy**; stable normal payloads → lower entropy |
-| **byte_sum** | Sum of DATA0–DATA7 | Captures overall payload magnitude shift under spoofing |
-| **byte_range** | max(DATA) − min(DATA) | Spread of byte values — attacks often widen or narrow this |
-| **byte_std** | Standard deviation across DATA bytes | Variability within one frame’s payload |
+
+| Feature                      | Formula / idea                                                  | Why it helps IDS                                                                    |
+| ---------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| **IAT** (Inter-Arrival Time) | `diff(Timestamp)`, first row = 0, clipped to [0, 1]             | DoS floods the bus → **very small IAT**; spoofing may change timing patterns        |
+| **CAN_ID_freq**              | Global frequency of each CAN_ID in that file (normalized count) | Rare IDs during an attack stand out; common IDs during normal driving get high freq |
+| **byte_entropy**             | Shannon entropy of non-zero DATA bytes in the row               | Random/fuzzy payloads → **high entropy**; stable normal payloads → lower entropy    |
+| **byte_sum**                 | Sum of DATA0–DATA7                                              | Captures overall payload magnitude shift under spoofing                             |
+| **byte_range**               | max(DATA) − min(DATA)                                           | Spread of byte values — attacks often widen or narrow this                          |
+| **byte_std**                 | Standard deviation across DATA bytes                            | Variability within one frame’s payload                                              |
+
 
 **Entropy detail:** Only non-zero bytes are used; if all zero, entropy = 0. Uses log₂ with a small epsilon for numerical stability.
 
@@ -590,6 +611,7 @@ Frames:  [f0, f1, f2, ..., f22, f23]
 ```
 
 **Why sliding windows?**
+
 - Stage 1 (CNN–BiGRU–Attention) and Stage 2 (sequence AE) need **temporal context** — one frame alone is weak; 24 frames capture bursts, timing, and short patterns.
 - Standard practice in CAN IDS (same idea as CANGuard’s windowing, different length).
 
@@ -612,6 +634,7 @@ Reshape back to (24, 14)
 ```
 
 **Why MinMax to [0, 1]?**
+
 - Neural nets train more stably on bounded inputs.
 - Stage 2 decoder uses **sigmoid** → outputs [0, 1]; inputs in the same range match.
 - GAN generator also outputs sigmoid in [0, 1] for flat probes.
@@ -668,15 +691,10 @@ Raw files (txt + CSV)
 ### 7.8 Presentation talking points
 
 1. **Dataset:** Car-Hacking — real CAN logs, 4 known attacks + normal; Flag column separates attack vs benign rows inside attack files.
-
 2. **14 features per frame:** 10 raw CAN fields + 6 engineered (timing, ID frequency, payload statistics).
-
 3. **Windows of 24 frames** give temporal context for CNN–BiGRU–Attention and sequence AE.
-
 4. **MinMax [0,1]** aligns with sigmoid AE/GAN and stabilizes training.
-
 5. **Stratified splits** preserve class balance; **AE sees only Normal** — core of zero-day detection design.
-
 6. **zero_day** is not in the raw dataset — it is evaluated using **synthetic GAN windows** at test time.
 
 ---
@@ -739,7 +757,7 @@ Our `CANGaurd_2Stage_GRU.py` **implements that backbone more faithfully than the
 ## Q9. How can we say our model is based on this base paper? (Explain how)
 
 This is a common viva question: *“You say CANGuard is your base paper — in what sense is your work actually based on it?”*  
-Below is an honest, defensible way to explain it for **`CANGaurd_2Stage_GRU.py`** specifically.
+Below is an honest, defensible way to explain it for `**CANGaurd_2Stage_GRU.py`** specifically.
 
 ---
 
@@ -753,11 +771,13 @@ We are **not** claiming we copied CANGuard’s exact dataset, hyperparameters, o
 
 ### What “based on” means in research (three levels)
 
-| Level | Meaning | Does our GRU work qualify? |
-|-------|---------|----------------------------|
-| **1. Problem & domain** | Same application: CAN bus IDS for connected vehicles | **Yes** — same threat model (DoS, spoofing, malicious frames on CAN) |
-| **2. Methodology** | Same high-level approach: deep learning on windowed CAN features with spatial + temporal + attention modeling | **Yes for Stage 1** — CNN + BiGRU + MHA on sliding windows |
-| **3. Exact replication** | Same model layers, same dataset, same hyperparameters, same paper results | **No** — different dataset (Car-Hacking), plus entire Stage 2; BiGRU depth/units may differ from paper |
+
+| Level                    | Meaning                                                                                                       | Does our GRU work qualify?                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| **1. Problem & domain**  | Same application: CAN bus IDS for connected vehicles                                                          | **Yes** — same threat model (DoS, spoofing, malicious frames on CAN)                                   |
+| **2. Methodology**       | Same high-level approach: deep learning on windowed CAN features with spatial + temporal + attention modeling | **Yes for Stage 1** — CNN + BiGRU + MHA on sliding windows                                             |
+| **3. Exact replication** | Same model layers, same dataset, same hyperparameters, same paper results                                     | **No** — different dataset (Car-Hacking), plus entire Stage 2; BiGRU depth/units may differ from paper |
+
 
 **Correct phrasing:** *“Inspired by and extended from CANGuard”* or *“Built on the CANGuard CNN–BiGRU–Attention paradigm with a novel second stage”* — not *“We replicated CANGuard on CICIoV2024.”*
 
@@ -831,30 +851,37 @@ That sentence is essentially our **Stage 2 design document**. Our work is “bas
 ### How to say it in a presentation (ready-made sentences)
 
 **Slide 1 — Base paper:**
+
 > “We take **CANGuard** (CNN–BiGRU–Attention) as our reference architecture for **known-attack detection** on in-vehicle CAN traffic.”
 
 **Slide 2 — Our extension:**
+
 > “CANGuard is **closed-set**: it cannot label attacks outside its training classes. We add **Stage 2**: an autoencoder ensemble trained only on Normal traffic, with Mahalanobis-based scoring, to flag **zero-day** windows that Stage 1 still calls Normal.”
 
 **Slide 3 — Relationship (one line):**
+
 > “**Stage 1 = CANGuard paradigm (this GRU script); Stage 2 = our contribution beyond the paper.**”
 
 **If examiner asks “Did you implement CANGuard?”**
+
 > “We implemented the **same architectural stack** (CNN + BiGRU + attention) for Stage 1, adapted to the Car-Hacking dataset and TensorFlow/Keras. Our **novel part** is the hybrid second stage — also sequence-aware with BiGRU and attention — which the base paper suggests but does not build.”
 
 **If examiner asks “How is this different from your LSTM script?”**
+
 > “The LSTM variant is an ablation with a simpler Stage-1 backbone (no attention). **This GRU script is the CANGuard-aligned variant**; both share the same two-stage pipeline and Stage-2 scoring.”
 
 ---
 
 ### What we should NOT claim (stay honest)
 
-| Do not say | Say instead |
-|------------|-------------|
-| “We implemented CANGuard.” | “We adapted the CANGuard **CNN–BiGRU–Attention supervised IDS approach** for Stage 1.” |
+
+| Do not say                                       | Say instead                                                                                                                     |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| “We implemented CANGuard.”                       | “We adapted the CANGuard **CNN–BiGRU–Attention supervised IDS approach** for Stage 1.”                                          |
 | “We improved CANGuard’s accuracy on CICIoV2024.” | “We evaluated on **Car-Hacking** with a **two-stage** system; direct accuracy comparison to the paper is not apples-to-apples.” |
-| “Our Stage 1 is identical to CANGuard.” | “Stage 1 is **inspired by** CANGuard: same component types (CNN, BiGRU, attention), adapted depth/units and dataset.” |
-| “CANGuard detects zero-day.” | “CANGuard does **not**; we add zero-day via Stage 2.” |
+| “Our Stage 1 is identical to CANGuard.”          | “Stage 1 is **inspired by** CANGuard: same component types (CNN, BiGRU, attention), adapted depth/units and dataset.”           |
+| “CANGuard detects zero-day.”                     | “CANGuard does **not**; we add zero-day via Stage 2.”                                                                           |
+
 
 ---
 
@@ -890,3 +917,4 @@ That sentence is essentially our **Stage 2 design document**. Our work is “bas
 ### One-paragraph viva answer (memorize this)
 
 > Our model is based on CANGuard because we adopt the same fundamental approach to CAN intrusion detection: we convert CAN traffic into sliding windows, extract spatio-temporal features with a convolutional front end, bidirectional GRU layers, and a multi-head attention block, and use a supervised classifier for known attack types. CANGuard stops at closed-set classification and notes that unknown attacks require additional mechanisms. We directly address that gap by adding Stage 2 — an unsupervised autoencoder ensemble (also using BiGRU and attention) with Mahalanobis anomaly scoring — on traffic that Stage 1 labels as Normal. So CANGuard is the foundation for known-attack detection in this script; our contribution is the hybrid extension for zero-day detection, which aligns with the base paper’s own suggested future direction.
+
